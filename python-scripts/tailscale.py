@@ -114,7 +114,7 @@ DEFAULT_OUT_BASENAME = "tailnet-policy"
 
 API_BASE = "https://api.tailscale.com"
 
-BASE_PREFIXES = ("owner-", "devrole-", "ownerdept-", "devname-")
+BASE_PREFIXES = ("owner-", "devrole-", "ownerdept-", "devdept-", "devname-")
 SERVICE_TAG_HEAD = "service-"  # tag value starts with "service-"
 GRANT_TAG_HEAD = "grant-"      # tag value starts with "grant-"
 
@@ -198,6 +198,25 @@ def die(msg: str, code: int = 2) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     raise SystemExit(code)
 
+def parse_device_tag_specs(tokens: Sequence[str]) -> List[Tuple[str, str]]:
+    """
+    Tokens:
+      ["device-1=owner-alice,devrole-server", "device-2=devdept-lab"]
+    Returns:
+      [(device_ident, "owner-alice,devrole-server"), ...]
+    """
+    out: List[Tuple[str, str]] = []
+    for tok in tokens:
+        if "=" not in tok:
+            die(f"--add/--rm tag expects device=tag,tag tokens, got: {tok!r}")
+        dev, tags_csv = tok.split("=", 1)
+        dev = dev.strip()
+        tags_csv = tags_csv.strip()
+        if not dev or not tags_csv:
+            die(f"Invalid tag spec {tok!r}. Expected device=tag,tag")
+        out.append((dev, tags_csv))
+    return out
+
 
 def normalize_tag_selector(tag: str) -> str:
     """
@@ -234,6 +253,9 @@ def tag_value(tag_selector: str) -> str:
 def is_base_tag_selector(tag_selector: str) -> bool:
     v = tag_value(tag_selector)
     return any(v.startswith(p) for p in BASE_PREFIXES)
+
+def is_owner_tag_selector(tag_selector: str) -> bool:
+    return tag_value(tag_selector).startswith("owner-")
 
 
 def normalize_grant_endpoint(sel: str) -> str:
@@ -1124,7 +1146,10 @@ def add_or_rm_device_tags(
     device_ident: str,
     tags_csv: str,
     remove: bool,
+    allow_owner_change: bool,
+    fix_enabled: bool,
 ) -> None:
+    
     tags = parse_tags_csv(tags_csv)
 
     # Ensure tags exist in tagOwners so they can be applied.
@@ -1146,13 +1171,86 @@ def add_or_rm_device_tags(
         die("Device record has no 'id' field; cannot tag.")
 
     current_norm = merge_tag_list(dev.get("tags", []))
+
+    # Enforce: at most one owner-* in the *requested* tags
+    owner_requested = [t for t in tags if is_owner_tag_selector(t)]
+    if len(owner_requested) > 1:
+        die(f"Refusing to specify multiple owner-* tags in one operation: {owner_requested}")
+
+    # Identify current owner tags (could be 0 or >1 if already messy)
+    current_owner = [t for t in current_norm if is_owner_tag_selector(t)]
+
     if remove:
+        # Only owner tag removals are gated. If not allowed, skip owner removal but still remove other tags.
+        removing_owner = any(is_owner_tag_selector(t) for t in tags)
+        if removing_owner and current_owner:
+            if not fix_enabled:
+                print(f"owner-tag: would remove {current_owner} from device '{device_ident}'")
+                tags = [t for t in tags if not is_owner_tag_selector(t)]
+            elif not allow_owner_change:
+                print(
+                    f"owner-tag: would remove {current_owner} from device '{device_ident}' "
+                    f"(skipped; missing --allow-owner-change)"
+                )
+                tags = [t for t in tags if not is_owner_tag_selector(t)]
+
         new_tags = [t for t in current_norm if t not in tags]
+
     else:
+        # Only owner tag replacement/normalization is gated. If not allowed, skip owner change but still add other tags.
+        if owner_requested:
+            new_owner = owner_requested[0]
+            replacing = any(t != new_owner for t in current_owner)
+            messy = len(current_owner) > 1
+
+            if current_owner and (replacing or messy):
+                if not fix_enabled:
+                    if replacing:
+                        print(f"owner-tag: would replace {current_owner} -> {new_owner} on device '{device_ident}'")
+                    else:
+                        print(
+                            f"owner-tag: would normalize multiple owners {current_owner} -> {new_owner} "
+                            f"on device '{device_ident}'"
+                        )
+                    tags = [t for t in tags if not is_owner_tag_selector(t)]
+
+                elif not allow_owner_change:
+                    if replacing:
+                        print(
+                            f"owner-tag: would replace {current_owner} -> {new_owner} on device '{device_ident}' "
+                            f"(skipped; missing --allow-owner-change)"
+                        )
+                    else:
+                        print(
+                            f"owner-tag: would normalize multiple owners {current_owner} -> {new_owner} "
+                            f"on device '{device_ident}' (skipped; missing --allow-owner-change)"
+                        )
+                    tags = [t for t in tags if not is_owner_tag_selector(t)]
+
+                else:
+                    if replacing:
+                        print(f"owner-tag: replacing {current_owner} -> {new_owner} on device '{device_ident}'")
+                    elif messy:
+                        print(
+                            f"owner-tag: normalizing multiple owners {current_owner} -> {new_owner} "
+                            f"on device '{device_ident}'"
+                        )
+
+                    # Allowed: enforce single owner by removing all existing owner tags
+                    current_norm = [t for t in current_norm if not is_owner_tag_selector(t)]
+
         new_tags = sorted(set(current_norm).union(tags))
+    
+    if not fix_enabled:
+        return
 
     api_set_device_tags(dev_id, api_key, new_tags)
 
+    # Post-apply confirmation only when we actually changed owner tags.
+    if (not remove) and owner_requested and allow_owner_change:
+        new_owner = owner_requested[0]
+        if current_owner and (any(t != new_owner for t in current_owner) or len(current_owner) > 1):
+            print(f"owner-tag: replaced {current_owner} -> {new_owner} on device id {dev_id}")
 
 def apply_pending_host_tag_changes(changes: List[PendingHostTagChange], tailnet: str, api_key: str) -> List[str]:
     notes: List[str] = []
@@ -1464,43 +1562,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--owner", default=cfg_get("TAILSCALE_OWNER_EMAIL", DEFAULT_OWNER_EMAIL), help="Owner email for tagOwners.")
 
     # Policy toggles
-    p.add_argument("--allow-all",dest="allow_all",choices=("yes", "no"),default=None,help="If 'yes', ensure an allow-all grant is present at the top of grants. If 'no', remove it. Omitted = no change.",
-    )
+    p.add_argument("--allow-all",dest="allow_all",choices=("yes", "no"),default=None,help="If 'yes', ensure an allow-all grant is present at the top of grants. If 'no', remove it. Omitted = no change.",)
     
 
     # Validation / fixing
     p.add_argument("--validate", action="store_true", help="Run validation checks (read-only). (Also runs by default.)")
     p.add_argument("--fix", action="store_true", help="Apply fixes for fixable validation issues (policy/devices).")
     p.add_argument("--validate-remote", action="store_true", help="Call Tailscale API /acl/validate (read-only).")
-    p.add_argument("--grant-gc",action="store_true",help="Garbage-collect unused tag:grant-* tagOwners and their associated policy grants (requires API).",
-)
+    p.add_argument("--grant-gc",action="store_true",help="Garbage-collect unused tag:grant-* tagOwners and their associated policy grants (requires API).",)
+    p.add_argument("--allow-owner-change",action="store_true",help="Allow removing/replacing existing owner-* tags on devices (dangerous; requires --fix).",)
+
 
     # Devname tooling
     p.add_argument("--gen-devname-tags",action="store_true",help="Generate expected tag:devname-* tagOwners entries from admin-console device names. " "Read-only unless combined with --fix.",)
     g = p.add_mutually_exclusive_group()
-    g.add_argument("--autotag-devnames", dest="autotag_devnames", action="store_true",
-                   help="Check devices for missing devname tags; apply during --fix.")
-    g.add_argument("--no-autotag-devnames", dest="autotag_devnames", action="store_false",
-                   help="Disable devname device-tag checks/fixes.")
+    g.add_argument("--autotag-devnames", dest="autotag_devnames", action="store_true",help="Check devices for missing devname tags; apply during --fix.")
+    g.add_argument("--no-autotag-devnames", dest="autotag_devnames", action="store_false",help="Disable devname device-tag checks/fixes.")
     p.set_defaults(autotag_devnames=False)
 
     # Operations: repeatable
-    p.add_argument(
-        "--add",
-        action="append",
-        nargs="+",
-        metavar=("KIND", "..."),
-        help="Add: base <tags...> | service <name=ports> [name=ports ...] | grant <host=client:svc,svc> [more...] | "
-             "tag <device> <tags_csv> (device tagging requires --fix).",
-    )
-    p.add_argument(
-        "--rm",
-        action="append",
-        nargs="+",
-        metavar=("KIND", "..."),
-        help="Remove: base <tags...> | service <name> | grant <host=client:svc,svc> [more...] | "
-             "tag <device> <tags_csv> (device tagging requires --fix).",
-    )
+    p.add_argument("--add",action="append",nargs="+",metavar=("KIND", "..."),help="Add: base <tags...> | service <name=ports> [name=ports ...] | grant <host=client:svc,svc> [more...] | ""tag <device=tags_csv> [more...] (device tagging requires --fix).",)
+    p.add_argument("--rm",action="append",nargs="+",metavar=("KIND", "..."),help="Remove: base <tags...> | service <name> [name ...] | grant <host=client:svc,svc> [more...] | " "tag <device=tags_csv> [more...] (device tagging requires --fix).",)
 
     return p
 
@@ -1528,6 +1610,7 @@ def main() -> None:
 
     add_ops = args.add or []
     rm_ops = args.rm or []
+    allow_owner_change=args.allow_owner_change,
 
     ops_need_api = any(op and op[0].lower() in ("tag", "grant") for op in (add_ops + rm_ops))
     needs_api = bool(args.pull or args.push or args.validate_remote or args.autotag_devnames or args.gen_devname_tags or args.grant_gc or ops_need_api)
@@ -1584,17 +1667,21 @@ def main() -> None:
             if not args.fix:
                 die("--add tag changes device state; run with --fix to allow it.")
             require_owner_email(args.owner)
-            if len(op) != 3:
-                die("--add tag requires: --add tag <device> <tags_csv>")
-            add_or_rm_device_tags(
+            if len(op) < 2:
+                die("--add tag requires: --add tag <device=tags_csv> [more...]")
+            for dev_ident, tags_csv in parse_device_tag_specs(op[1:]):
+                add_or_rm_device_tags(
                 policy_after,
                 args.owner,
                 tailnet=args.tailnet,
                 api_key=args.api_key,
-                device_ident=op[1],
-                tags_csv=op[2],
+                device_ident=dev_ident,
+                tags_csv=tags_csv,
                 remove=False,
+                allow_owner_change=args.allow_owner_change,
+                fix_enabled=args.fix,
             )
+
         else:
             die(f"Unknown --add kind: {kind!r}")
 
@@ -1603,9 +1690,11 @@ def main() -> None:
         if kind == "base":
             rm_base(policy_after, op[1:])
         elif kind == "service":
-            if len(op) != 2:
-                die("--rm service requires: --rm service <name>")
-            rm_service(policy_after, op[1])
+            if len(op) < 2:
+                die("--rm service requires: --rm service <name> [name ...]")
+            for name in op[1:]:
+                rm_service(policy_after, name)
+
         elif kind == "grant":
             if len(op) < 2:
                 die("--rm grant requires: --rm grant <host=client:svc,svc> [more...]")
@@ -1622,16 +1711,19 @@ def main() -> None:
             if not args.fix:
                 die("--rm tag changes device state; run with --fix to allow it.")
             require_owner_email(args.owner)
-            if len(op) != 3:
-                die("--rm tag requires: --rm tag <device> <tags_csv>")
-            add_or_rm_device_tags(
+            if len(op) < 2:
+                die("--rm tag requires: --rm tag <device=tags_csv> [more...]")
+            for dev_ident, tags_csv in parse_device_tag_specs(op[1:]):
+                add_or_rm_device_tags(
                 policy_after,
                 args.owner,
                 tailnet=args.tailnet,
                 api_key=args.api_key,
-                device_ident=op[1],
-                tags_csv=op[2],
+                device_ident=dev_ident,
+                tags_csv=tags_csv,
                 remove=True,
+                allow_owner_change=args.allow_owner_change,
+                fix_enabled=args.fix,
             )
         else:
             die(f"Unknown --rm kind: {kind!r}")
