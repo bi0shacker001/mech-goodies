@@ -5,18 +5,26 @@ tailscale.py (Tailscale policy + tagging helper)
 What it does:
 - --pull: fetch current tailnet ACL policy JSON from the Tailscale API
 - --in: read a local policy file (JSON/JSON5/HuJSON-ish via json5)
-- --out: write a *pair* of files (pre/post) to disk
+- --out: write a *pair* of files (pre/post) to disk (defaults to ~/.config/mech-goodies/tailscale/logs/)
 - --validate: run read-only checks (default behavior anyway)
 - --fix: apply fixes (policy edits and/or device tag edits), then re-validate
 - --validate-remote: call Tailscale /acl/validate (read-only)
-- --push: push policy back to the tailnet (only if validation is clean)
+- --push: push updated policy back to the tailnet (only if validation is clean)
 - --allow-all=(yes,no): yes ensures an allow-all grant exists at the top of "grants";
   no ensures there isn't. Omitted = no change.
+
+Services model:
+- A service is defined by a service tag:
+    tag:service-<service>
+  And a global grant:
+    src ["*"] -> dst ["tag:service-<service>"] with ip ["tcp:PORT", "udp:PORT", ...]
+  Tagging a host with tag:service-<service> means "this host runs this service", and it is globally reachable
+  by whatever the grants allow (the default "global grant" above allows everyone to reach it on those ports).
 
 Adding services:
 - --add service <name=ports> [name=ports ...]
   Example:
-    --add service sonarr=8989 radarr=7878 jellyfin=8096,8920
+    --add service sonarr=8989/tcp radarr=7878 jellyfin=8096,8920
 
 Ports spec syntax (for name=ports):
 - Commas separate tokens only.
@@ -30,10 +38,28 @@ Ports spec syntax (for name=ports):
     tcp:443,udp:53,tcp:80-443,icmp:*
   (Do not combine these with /tcp or /udp on the same token.)
 
+Grant tags model (service access by client tags):
+- A grant tag is:
+    tag:grant-<service>-<clientTagValue>
+  Example:
+    tag:grant-sonarr-owner-alice
+- Policy grants:
+    src ["tag:<clientTagValue>"] -> dst ["tag:grant-<service>-<clientTagValue>"] with ip matching the service definition
+- Tagging a host with tag:grant-<service>-<clientTagValue> means:
+    "clients with <clientTagValue> may access <service> on this host"
+
+Host-specific grant operations:
+- --add grant <host>=<clientTag>:<svc,svc,...> [more...]
+  Example:
+    --add grant media-host-1=owner-alice:sonarr,radarr
+- --rm grant <host>=<clientTag>:<svc,svc,...> [more...]
+  Example:
+    --rm grant media-host-1=owner-alice:sonarr
+
 Devname workflow:
 - --gen-devname-tags:
     - validate: detect missing tagOwners entries for tag:devname-<device>
-    - fix: add missing tagOwners entries for those devname tags
+    - fix: add missing devname tagOwners entries
 - --autotag-devnames:
     - validate: detect devices missing their tag:devname-<device> tag
     - fix: apply missing devname tags to devices via API
@@ -49,7 +75,7 @@ tailscale.env example:
   # comments ok
   TAILSCALE_API_KEY=tskey-api-xxxxxxxx
   TAILSCALE_TAILNET=-
-  TAILSCALE_OWNER_EMAIL=me@example.com
+  TAILSCALE_OWNER_EMAIL=admin@example.com
 
 Dependencies:
   pip install requests json5
@@ -90,6 +116,7 @@ API_BASE = "https://api.tailscale.com"
 
 BASE_PREFIXES = ("owner-", "devrole-", "ownerdept-", "devname-")
 SERVICE_TAG_HEAD = "service-"  # tag value starts with "service-"
+GRANT_TAG_HEAD = "grant-"      # tag value starts with "grant-"
 
 
 # -----------------------------
@@ -101,6 +128,13 @@ class Issue:
     msg: str
     fixable: bool = True
     data: Optional[dict] = None
+
+
+@dataclass
+class PendingHostTagChange:
+    host_ident: str
+    add_tags: List[str]
+    remove_tags: List[str]
 
 
 # -----------------------------
@@ -159,95 +193,6 @@ def cfg_get(key: str, default: str) -> str:
 def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
 
-ALLOW_ALL_GRANT = {"src": ["*"], "dst": ["*"], "ip": ["*"]}
-
-
-def is_allow_all_grant(g: Any) -> bool:
-    """
-    Detect the canonical allow-all grant:
-      {"src":["*"],"dst":["*"],"ip":["*"]}
-    We intentionally ignore ordering in the dict and tolerate extra keys only if they are empty/absent.
-    """
-    if not isinstance(g, dict):
-        return False
-    if g.get("src") != ["*"] or g.get("dst") != ["*"] or g.get("ip") != ["*"]:
-        return False
-
-    # If someone made a "mostly allow all but with app/via/posture", don't treat it as the canonical allow-all.
-    for k in ("app", "via", "srcPosture"):
-        if k in g and g.get(k):
-            return False
-
-    return True
-
-
-def apply_allow_all_setting(policy: Dict[str, Any], mode: Optional[str]) -> List[str]:
-    """
-    mode:
-      - "yes": ensure allow-all grant exists and is the first grant
-      - "no": ensure no allow-all grant exists
-      - None: do nothing
-    Returns human-friendly notes about what changed.
-    """
-    if mode is None:
-        return []
-
-    ensure_policy_shape(policy)
-
-    if not isinstance(policy.get("grants"), list):
-        policy["grants"] = []
-
-    grants: List[Dict[str, Any]] = policy["grants"]
-    allow_all = [g for g in grants if is_allow_all_grant(g)]
-    others = [g for g in grants if not is_allow_all_grant(g)]
-
-    notes: List[str] = []
-
-    if mode == "yes":
-        if allow_all:
-            keep = allow_all[0]
-            if grants and grants[0] is keep:
-                notes.append("already present at top")
-            else:
-                notes.append("moved to top")
-            if len(allow_all) > 1:
-                notes.append(f"removed {len(allow_all) - 1} duplicate(s)")
-        else:
-            keep = copy.deepcopy(ALLOW_ALL_GRANT)
-            notes.append("added")
-
-        policy["grants"] = [keep] + others
-        return notes
-
-    if mode == "no":
-        if allow_all:
-            policy["grants"] = others
-            notes.append(f"removed {len(allow_all)}")
-        else:
-            notes.append("already absent")
-        return notes
-
-    die("--allow-all must be 'yes' or 'no' (or omitted).")
-    return []
-
-def parse_service_specs(tokens: Sequence[str]) -> List[Tuple[str, str]]:
-    """
-    Parse tokens like:
-      ["sonarr=8989", "radarr=7878", "jellyfin=8096,8920", "foo=8000-8100"]
-    Returns list of (service, ports_spec).
-    """
-    specs: List[Tuple[str, str]] = []
-    for tok in tokens:
-        if "=" not in tok:
-            die(f"--add service expects name=ports tokens, got: {tok!r}")
-        name, ports = tok.split("=", 1)
-        name = name.strip()
-        ports = ports.strip()
-        if not name or not ports:
-            die(f"Invalid service spec {tok!r}. Expected name=ports.")
-        specs.append((name, ports))
-    return specs
-
 
 def die(msg: str, code: int = 2) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
@@ -291,6 +236,144 @@ def is_base_tag_selector(tag_selector: str) -> bool:
     return any(v.startswith(p) for p in BASE_PREFIXES)
 
 
+def normalize_grant_endpoint(sel: str) -> str:
+    """
+    For grants src/dst entries we allow:
+      - "*" (all)
+      - tag selectors (normalized)
+      - autogroup:/group: entries (pass-through)
+      - emails (pass-through)
+    """
+    s = sel.strip()
+    if not s:
+        die("Empty grant endpoint selector.")
+    if s == "*":
+        return "*"
+    if s.startswith(("autogroup:", "group:")):
+        return s
+    if "@" in s and not s.startswith("tag:"):
+        return s
+    return normalize_tag_selector(s)
+
+
+def normalize_ip_list(ip: List[str]) -> List[str]:
+    # stable: unique then sort (string sort is fine for our canonical output)
+    uniq = sorted(set(ip))
+    return uniq
+
+def list_grant_tags(policy: Dict[str, Any]) -> List[str]:
+    """
+    Collect all tag:grant-* tags referenced by policy, from:
+      - tagOwners keys
+      - grants[*].dst
+    """
+    ensure_policy_shape(policy)
+    found: set[str] = set()
+
+    for t in (policy.get("tagOwners") or {}).keys():
+        try:
+            ts = normalize_tag_selector(t)
+        except SystemExit:
+            continue
+        if parse_grant_tag(ts):
+            found.add(ts)
+
+    for g in policy.get("grants") or []:
+        dsts = g.get("dst", [])
+        if isinstance(dsts, list) and len(dsts) == 1 and isinstance(dsts[0], str):
+            try:
+                dst0 = normalize_tag_selector(dsts[0])
+            except SystemExit:
+                continue
+            if parse_grant_tag(dst0):
+                found.add(dst0)
+
+    return sorted(found)
+
+
+def collect_all_device_tags(tailnet: str, api_key: str) -> set[str]:
+    """
+    Union of all tags currently assigned to any device in the tailnet.
+    """
+    devices = api_list_devices(tailnet, api_key)
+    used: set[str] = set()
+    for d in devices:
+        for t in merge_tag_list(d.get("tags", [])):
+            used.add(t)
+    return used
+
+
+def collect_unused_grant_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: str) -> List[Issue]:
+    """
+    Read-only: report tag:grant-* tags that exist in policy but are not assigned to any device.
+    """
+    ensure_policy_shape(policy)
+    issues: List[Issue] = []
+
+    policy_grant_tags = list_grant_tags(policy)
+    if not policy_grant_tags:
+        return issues
+
+    used_device_tags = collect_all_device_tags(tailnet, api_key)
+
+    for gt in policy_grant_tags:
+        if gt not in used_device_tags:
+            issues.append(Issue(
+                kind="unused-grant-tag",
+                msg=f"Grant tag {gt} is not assigned to any device; safe to remove from tagOwners and policy grants.",
+                fixable=True,
+                data={"tag": gt},
+            ))
+
+    return issues
+
+
+def apply_grant_gc_fixes(policy: Dict[str, Any], issues: List[Issue]) -> List[str]:
+    """
+    Remove unused grant tags from:
+      - tagOwners
+      - policy grants where dst == [that tag]
+    Returns notes.
+    """
+    ensure_policy_shape(policy)
+    notes: List[str] = []
+
+    to_remove: set[str] = set()
+    for iss in issues:
+        if iss.fixable and iss.kind == "unused-grant-tag" and iss.data and "tag" in iss.data:
+            to_remove.add(normalize_tag_selector(iss.data["tag"]))
+
+    if not to_remove:
+        return notes
+
+    # Remove from tagOwners
+    for t in sorted(to_remove):
+        if t in policy["tagOwners"]:
+            policy["tagOwners"].pop(t, None)
+            notes.append(f"grant-gc: removed tagOwners entry for {t}")
+
+    # Remove from grants
+    kept: List[Dict[str, Any]] = []
+    removed_count = 0
+    for g in policy.get("grants", []):
+        dsts = g.get("dst", [])
+        if isinstance(dsts, list) and len(dsts) == 1 and isinstance(dsts[0], str):
+            try:
+                dst0 = normalize_tag_selector(dsts[0])
+            except SystemExit:
+                kept.append(g)
+                continue
+            if dst0 in to_remove:
+                removed_count += 1
+                continue
+        kept.append(g)
+
+    if removed_count:
+        notes.append(f"grant-gc: removed {removed_count} policy grant rule(s) targeting unused grant tags")
+
+    policy["grants"] = kept
+    return notes
+
 def parse_ports_spec(ports_spec: str) -> List[str]:
     """
     Input examples:
@@ -303,8 +386,8 @@ def parse_ports_spec(ports_spec: str) -> List[str]:
       "*", "*/tcp", "*/udp"   -> ["*"], ["tcp:*"], ["udp:*"]
 
     Only commas separate tokens.
-    Port ranges accept '-' or ':' in input (':' normalized to '-').
-    Bare ports/ranges default to BOTH tcp+udp (least-privilege; avoids the implicit ICMP that "<port>" would allow).
+    Port ranges accept '-' or ':' in input (':' is normalized to '-').
+    Bare ports/ranges default to BOTH tcp+udp.
     """
     raw = ports_spec.strip()
     if not raw:
@@ -315,6 +398,7 @@ def parse_ports_spec(ports_spec: str) -> List[str]:
     seen: set[str] = set()
 
     def emit(s: str) -> None:
+        s = s.lower()
         if s not in seen:
             out.append(s)
             seen.add(s)
@@ -324,7 +408,7 @@ def parse_ports_spec(ports_spec: str) -> List[str]:
             die(f"Port out of range: {n}")
 
     for tok in parts:
-        # Optional suffix: /tcp or /udp (we only support these as requested)
+        # Optional suffix: /tcp or /udp
         proto_suffix: Optional[str] = None
         if "/" in tok:
             base, suf = tok.rsplit("/", 1)
@@ -339,8 +423,7 @@ def parse_ports_spec(ports_spec: str) -> List[str]:
         if not tok:
             die("Empty token in ports spec.")
 
-        # Allow direct capability selectors (pass-through), e.g. tcp:443, udp:53, icmp:*, tcp:80-443
-        # (If user writes these, they must NOT also use /tcp or /udp.)
+        # Direct capability selector pass-through (must not combine with /tcp or /udp)
         mcap = re.fullmatch(r"([a-z0-9]+):(\*|\d{1,5}|\d{1,5}-\d{1,5})", tok.lower())
         if mcap:
             if proto_suffix is not None:
@@ -348,7 +431,7 @@ def parse_ports_spec(ports_spec: str) -> List[str]:
             emit(tok.lower())
             continue
 
-        # Allow "*" optionally scoped by /tcp or /udp
+        # Wildcard
         if tok == "*":
             if proto_suffix is None:
                 emit("*")
@@ -361,7 +444,7 @@ def parse_ports_spec(ports_spec: str) -> List[str]:
             a, b = tok.split(":", 1)
             tok = f"{a}-{b}"
 
-        # Parse single port
+        # Single port
         if re.fullmatch(r"\d{1,5}", tok):
             port = int(tok)
             validate_port(port)
@@ -372,7 +455,7 @@ def parse_ports_spec(ports_spec: str) -> List[str]:
                 emit(f"{proto_suffix}:{port}")
             continue
 
-        # Parse port range
+        # Range
         m = re.fullmatch(r"(\d{1,5})-(\d{1,5})", tok)
         if m:
             a = int(m.group(1))
@@ -391,8 +474,7 @@ def parse_ports_spec(ports_spec: str) -> List[str]:
 
         die(f"Invalid port token {tok!r}. Use '443', '80-443', '80:443', '8989/tcp', or 'udp:53'.")
 
-    return out
-
+    return normalize_ip_list(out)
 
 
 def parse_tags_csv(tags_csv: str) -> List[str]:
@@ -424,27 +506,28 @@ def remove_tag_owner(policy: Dict[str, Any], tag_selector: str) -> None:
 
 def upsert_grant(policy: Dict[str, Any], src: str, dst: str, ip: List[str]) -> None:
     ensure_policy_shape(policy)
-    src_s = normalize_tag_selector(src)
-    dst_s = normalize_tag_selector(dst)
-    desired = {"src": [src_s], "dst": [dst_s], "ip": ip}
+    src_s = normalize_grant_endpoint(src)
+    dst_s = normalize_grant_endpoint(dst)
+    ip_n = normalize_ip_list(ip)
+    desired = {"src": [src_s], "dst": [dst_s], "ip": ip_n}
 
     grants: List[Dict[str, Any]] = policy["grants"]
     for g in grants:
         if g.get("src") == [src_s] and g.get("dst") == [dst_s]:
-            g["ip"] = ip
+            g["ip"] = ip_n
             return
     grants.append(desired)
 
 
 def grant_exists(policy: Dict[str, Any], src: str, dst: str, ip: Optional[List[str]] = None) -> bool:
     ensure_policy_shape(policy)
-    src_s = normalize_tag_selector(src)
-    dst_s = normalize_tag_selector(dst)
+    src_s = normalize_grant_endpoint(src)
+    dst_s = normalize_grant_endpoint(dst)
     for g in policy["grants"]:
         if g.get("src") == [src_s] and g.get("dst") == [dst_s]:
             if ip is None:
                 return True
-            if isinstance(g.get("ip"), list) and list(g["ip"]) == list(ip):
+            if isinstance(g.get("ip"), list) and normalize_ip_list(list(g["ip"])) == normalize_ip_list(list(ip)):
                 return True
     return False
 
@@ -461,24 +544,42 @@ def list_base_tags(policy: Dict[str, Any]) -> List[str]:
     return sorted(set(tags))
 
 
-def parse_service_tag(tag_selector: str) -> Optional[Tuple[str, str]]:
+def parse_service_tag(tag_selector: str) -> Optional[str]:
     """
-    tag:service-<service>-<baseTagValue>
-    Returns: (serviceName, baseTagValue) where baseTagValue has no "tag:" prefix.
+    tag:service-<service>
+    Returns: service name
     """
     ts = normalize_tag_selector(tag_selector)
-    v = tag_value(ts)  # e.g. "service-jellyfin-owner-mschuett"
+    v = tag_value(ts)  # e.g. "service-sonarr"
     if not v.startswith(SERVICE_TAG_HEAD):
         return None
+    service = v[len(SERVICE_TAG_HEAD):]
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", service):
+        return None
+    return service
 
-    rest = v[len(SERVICE_TAG_HEAD):]  # "jellyfin-owner-mschuett"
+
+def parse_grant_tag(tag_selector: str) -> Optional[Tuple[str, str]]:
+    """
+    tag:grant-<service>-<clientTagValue>
+    clientTagValue is expected to start with one of BASE_PREFIXES.
+
+    Returns: (service, clientTagValue)
+    """
+    ts = normalize_tag_selector(tag_selector)
+    v = tag_value(ts)  # e.g. "grant-sonarr-owner-mschuett"
+    if not v.startswith(GRANT_TAG_HEAD):
+        return None
+
+    rest = v[len(GRANT_TAG_HEAD):]  # "sonarr-owner-mschuett"
     for base_prefix in BASE_PREFIXES:
         marker = "-" + base_prefix
         idx = rest.rfind(marker)
         if idx > 0:
             service = rest[:idx]
-            base = rest[idx + 1:]
-            return (service, base)
+            client_val = rest[idx + 1:]
+            if re.fullmatch(r"[a-z][a-z0-9-]*", service) and re.fullmatch(r"[a-z][a-z0-9-]*", client_val):
+                return (service, client_val)
     return None
 
 
@@ -488,44 +589,47 @@ def list_services(policy: Dict[str, Any]) -> List[str]:
 
     # Discover from tagOwners
     for t in policy["tagOwners"].keys():
-        parsed = parse_service_tag(t)
-        if parsed:
-            services.add(parsed[0])
+        svc = parse_service_tag(t)
+        if svc:
+            services.add(svc)
 
     # Discover from grants too
     for g in policy["grants"]:
         dsts = g.get("dst")
         if isinstance(dsts, list) and len(dsts) == 1 and isinstance(dsts[0], str):
-            parsed = parse_service_tag(dsts[0])
-            if parsed:
-                services.add(parsed[0])
+            svc = parse_service_tag(dsts[0])  # service tags can be a dst
+            if svc:
+                services.add(svc)
 
     return sorted(services)
 
 
-def service_tag_for(service: str, base_tag_value: str) -> str:
-    return normalize_tag_selector(f"service-{service}-{base_tag_value}")
+def service_tag_for(service: str) -> str:
+    return normalize_tag_selector(f"service-{service}")
+
+
+def grant_tag_for(service: str, client_tag_value: str) -> str:
+    return normalize_tag_selector(f"grant-{service}-{client_tag_value}")
 
 
 def infer_service_ip_from_grants(policy: Dict[str, Any]) -> Dict[str, List[str]]:
     """
-    Canonical ports per service are inferred from existing grants that target that service.
+    Canonical ports per service inferred from existing grants where:
+      dst == [tag:service-<service>]
     """
     ensure_policy_shape(policy)
     service_ip: Dict[str, List[str]] = {}
 
     for g in policy["grants"]:
         dsts = g.get("dst", [])
-        if not (isinstance(dsts, list) and dsts):
+        if not (isinstance(dsts, list) and len(dsts) == 1 and isinstance(dsts[0], str)):
             continue
-        dst0 = dsts[0]
-        parsed = parse_service_tag(dst0)
-        if not parsed:
+        svc = parse_service_tag(dsts[0])
+        if not svc:
             continue
-        service, _base = parsed
         ip = g.get("ip", [])
-        if isinstance(ip, list) and ip and service not in service_ip:
-            service_ip[service] = list(ip)
+        if isinstance(ip, list) and ip and svc not in service_ip:
+            service_ip[svc] = normalize_ip_list(list(ip))
 
     return service_ip
 
@@ -542,6 +646,71 @@ def list_devname_tags(policy: Dict[str, Any]) -> List[str]:
         if v.startswith("devname-"):
             out.append(ts)
     return sorted(set(out))
+
+
+# -----------------------------
+# Allow-all grant toggling
+# -----------------------------
+ALLOW_ALL_GRANT = {"src": ["*"], "dst": ["*"], "ip": ["*"]}
+
+
+def is_allow_all_grant(g: Any) -> bool:
+    if not isinstance(g, dict):
+        return False
+    if g.get("src") != ["*"] or g.get("dst") != ["*"] or g.get("ip") != ["*"]:
+        return False
+    # Don't treat posture/via/app rules as the canonical allow-all.
+    for k in ("app", "via", "srcPosture"):
+        if k in g and g.get(k):
+            return False
+    return True
+
+
+def apply_allow_all_setting(policy: Dict[str, Any], mode: Optional[str]) -> List[str]:
+    """
+    mode:
+      - "yes": ensure allow-all grant exists and is the first grant
+      - "no": ensure no allow-all grant exists
+      - None: do nothing
+    Returns notes about what changed.
+    """
+    if mode is None:
+        return []
+
+    ensure_policy_shape(policy)
+    if not isinstance(policy.get("grants"), list):
+        policy["grants"] = []
+
+    grants: List[Dict[str, Any]] = policy["grants"]
+    allow_all = [g for g in grants if is_allow_all_grant(g)]
+    others = [g for g in grants if not is_allow_all_grant(g)]
+    notes: List[str] = []
+
+    if mode == "yes":
+        if allow_all:
+            keep = allow_all[0]
+            if grants and grants[0] is keep:
+                notes.append("already present at top")
+            else:
+                notes.append("moved to top")
+            if len(allow_all) > 1:
+                notes.append(f"removed {len(allow_all) - 1} duplicate(s)")
+        else:
+            keep = copy.deepcopy(ALLOW_ALL_GRANT)
+            notes.append("added")
+        policy["grants"] = [keep] + others
+        return notes
+
+    if mode == "no":
+        if allow_all:
+            policy["grants"] = others
+            notes.append(f"removed {len(allow_all)}")
+        else:
+            notes.append("already absent")
+        return notes
+
+    die("--allow-all must be 'yes' or 'no' (or omitted).")
+    return []
 
 
 # -----------------------------
@@ -666,10 +835,6 @@ def canonical_device_name(d: Dict[str, Any]) -> Optional[str]:
 
 
 def device_match_fields(d: Dict[str, Any]) -> List[str]:
-    """
-    Fields we allow matching against for user-provided device identifiers.
-    We normalize by stripping the tailnet suffix when present.
-    """
     fields: List[str] = []
     for k in ("name", "hostname", "hostName", "machineName", "dnsName"):
         v = d.get(k)
@@ -678,11 +843,14 @@ def device_match_fields(d: Dict[str, Any]) -> List[str]:
     return fields
 
 
-def find_devices_by_devname(devices: List[Dict[str, Any]], devname: str) -> List[Dict[str, Any]]:
-    target = devname.strip().lower()
-    if not target:
+def find_devices_by_ident(devices: List[Dict[str, Any]], ident: str) -> List[Dict[str, Any]]:
+    ident = ident.strip()
+    if not ident:
         return []
+    if ident.isdigit():
+        return [d for d in devices if str(d.get("id", "")).strip() == ident]
 
+    target = ident.lower()
     matches: List[Dict[str, Any]] = []
     for d in devices:
         fields_l = [f.lower() for f in device_match_fields(d)]
@@ -703,20 +871,13 @@ def merge_tag_list(existing: Any) -> List[str]:
     for t in existing:
         if isinstance(t, str) and t.strip():
             out.append(normalize_tag_selector(t))
-    return out
+    return sorted(set(out))
 
 
 # -----------------------------
 # Devname tag generation
 # -----------------------------
 def sanitize_for_tag_component(s: str) -> str:
-    """
-    Convert arbitrary device names into a safe tag component:
-    - lowercase
-    - non [a-z0-9] -> '-'
-    - collapse '-' runs
-    - strip leading/trailing '-'
-    """
     s = s.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "-", s)
     s = re.sub(r"-{2,}", "-", s)
@@ -730,11 +891,6 @@ def devname_tag_for_device_name(name: str) -> str:
 
 
 def desired_devname_tags_from_devices(devices: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
-    """
-    Returns:
-      desired_tags: unique list of tag selectors (tag:devname-*)
-      notes: collisions/skips
-    """
     notes: List[str] = []
     mapping: Dict[str, List[str]] = {}
 
@@ -785,7 +941,7 @@ def apply_missing_devname_tagowners(policy: Dict[str, Any], owner_email: str, is
 
 
 # -----------------------------
-# Ops: add/rm base/service/tag
+# Ops: add/rm base/service/tag/grant
 # -----------------------------
 def add_base(policy: Dict[str, Any], owner_email: str, tags: Sequence[str]) -> None:
     if not tags:
@@ -802,14 +958,15 @@ def rm_base(policy: Dict[str, Any], tags: Sequence[str]) -> None:
     for t in norm:
         remove_tag_owner(policy, t)
 
+    # Also remove grant tags that reference removed base tags (clientTagValue)
     base_values = {tag_value(t) for t in norm}
 
-    def is_service_for_removed_base(tag_sel: str) -> bool:
-        parsed = parse_service_tag(tag_sel)
+    def is_grant_for_removed_base(tag_sel: str) -> bool:
+        parsed = parse_grant_tag(tag_sel)
         return bool(parsed and parsed[1] in base_values)
 
     for t in list(policy.get("tagOwners", {}).keys()):
-        if is_service_for_removed_base(t):
+        if is_grant_for_removed_base(t):
             policy["tagOwners"].pop(t, None)
 
     base_set = set(norm)
@@ -822,10 +979,12 @@ def rm_base(policy: Dict[str, Any], tags: Sequence[str]) -> None:
             kept.append(g)
             continue
 
+        # Remove grants whose src is a removed base tag
         if len(srcs) == 1 and srcs[0] in base_set:
             continue
 
-        if len(dsts) == 1 and is_service_for_removed_base(dsts[0]):
+        # Remove grants whose dst is a grant tag for a removed base tag
+        if len(dsts) == 1 and is_grant_for_removed_base(dsts[0]):
             continue
 
         kept.append(g)
@@ -836,17 +995,13 @@ def add_service(policy: Dict[str, Any], owner_email: str, service: str, ports_sp
     svc = service.strip().lower()
     if not re.fullmatch(r"[a-z][a-z0-9-]*", svc):
         die("Service name must be letters/digits/dashes, starting with a letter.")
-
     ip = parse_ports_spec(ports_spec)
-    base_tags = list_base_tags(policy)
-    if not base_tags:
-        die("No base tags found in tagOwners. Add base tags first (--add base ...).")
 
-    for bt in base_tags:
-        bt_val = tag_value(bt)
-        st = service_tag_for(svc, bt_val)
-        set_tag_owner(policy, st, owner_email)
-        upsert_grant(policy, src=bt, dst=st, ip=ip)
+    st = service_tag_for(svc)
+    set_tag_owner(policy, st, owner_email)
+
+    # Global service definition grant: everyone -> service tag on these ports
+    upsert_grant(policy, src="*", dst=st, ip=ip)
 
 
 def rm_service(policy: Dict[str, Any], service: str) -> None:
@@ -855,23 +1010,109 @@ def rm_service(policy: Dict[str, Any], service: str) -> None:
         die("Service name is empty.")
     ensure_policy_shape(policy)
 
+    st = service_tag_for(svc)
+    policy["tagOwners"].pop(st, None)
+
+    # Remove grant tags for this service
     to_remove = []
     for t in policy["tagOwners"].keys():
-        parsed = parse_service_tag(t)
+        parsed = parse_grant_tag(t)
         if parsed and parsed[0] == svc:
             to_remove.append(t)
     for t in to_remove:
         policy["tagOwners"].pop(t, None)
 
+    # Remove grants whose dst is the service tag or any of its grant tags
     kept = []
     for g in policy["grants"]:
         dsts = g.get("dst", [])
-        if isinstance(dsts, list) and len(dsts) == 1:
-            parsed = parse_service_tag(dsts[0])
+        if isinstance(dsts, list) and len(dsts) == 1 and isinstance(dsts[0], str):
+            dst0 = dsts[0]
+            if normalize_grant_endpoint(dst0) == st:
+                continue
+            parsed = parse_grant_tag(dst0)
             if parsed and parsed[0] == svc:
                 continue
         kept.append(g)
     policy["grants"] = kept
+
+
+def parse_service_specs(tokens: Sequence[str]) -> List[Tuple[str, str]]:
+    specs: List[Tuple[str, str]] = []
+    for tok in tokens:
+        if "=" not in tok:
+            die(f"--add service expects name=ports tokens, got: {tok!r}")
+        name, ports = tok.split("=", 1)
+        name = name.strip()
+        ports = ports.strip()
+        if not name or not ports:
+            die(f"Invalid service spec {tok!r}. Expected name=ports.")
+        specs.append((name, ports))
+    return specs
+
+
+def parse_grant_specs(tokens: Sequence[str]) -> List[Tuple[str, str, List[str]]]:
+    """
+    Each token: <host>=<clientTag>:<svc,svc,...>
+      mhmc-hetz-1=owner-mschuett:sonarr,radarr
+    Returns: [(host_ident, client_tag_selector, [services...]), ...]
+    """
+    out: List[Tuple[str, str, List[str]]] = []
+    for tok in tokens:
+        if "=" not in tok:
+            die(f"--add/--rm grant expects host=clientTag:svc,svc tokens, got: {tok!r}")
+        host, rhs = tok.split("=", 1)
+        host = host.strip()
+        rhs = rhs.strip()
+        if not host or not rhs or ":" not in rhs:
+            die(f"Invalid grant spec {tok!r}. Expected host=clientTag:svc,svc")
+        client, svcs = rhs.split(":", 1)
+        client = normalize_tag_selector(client.strip())
+        svcs = [s.strip().lower() for s in svcs.split(",") if s.strip()]
+        if not svcs:
+            die(f"Invalid grant spec {tok!r}: no services listed.")
+        for s in svcs:
+            if not re.fullmatch(r"[a-z][a-z0-9-]*", s):
+                die(f"Invalid service name {s!r} in {tok!r}. Use letters/digits/dashes, starting with a letter.")
+        out.append((host, client, svcs))
+    return out
+
+
+def service_ports_or_die(policy: Dict[str, Any], service: str) -> List[str]:
+    st = service_tag_for(service)
+    if st not in policy.get("tagOwners", {}):
+        die(f"Service tag {st} does not exist in tagOwners. Define it first with --add service {service}=<ports>")
+
+    service_ip = infer_service_ip_from_grants(policy)
+    ip = service_ip.get(service)
+    if not ip:
+        die(f"Service '{service}' has no inferable ports (no grant with dst [{st}] and ip). Re-add service with ports.")
+    return ip
+
+
+def ensure_grant_tag_and_rule(policy: Dict[str, Any], owner_email: str, client_tag: str, service: str) -> str:
+    """
+    Ensure:
+      - tagOwners has tag:grant-<service>-<clientTagValue>
+      - grants contains client_tag -> grant_tag with ip matching service definition
+    Returns the grant_tag selector.
+    """
+    ensure_policy_shape(policy)
+
+    # client_tag must exist as a base tag in tagOwners (we use it as src)
+    if client_tag not in policy.get("tagOwners", {}):
+        die(f"Client tag {client_tag} is not defined in tagOwners. Add it via --add base ... first.")
+
+    ip = service_ports_or_die(policy, service)
+
+    client_val = tag_value(client_tag)
+    gt = grant_tag_for(service, client_val)
+    set_tag_owner(policy, gt, owner_email)
+
+    if not grant_exists(policy, src=client_tag, dst=gt, ip=ip):
+        upsert_grant(policy, src=client_tag, dst=gt, ip=ip)
+
+    return gt
 
 
 def add_or_rm_device_tags(
@@ -892,9 +1133,9 @@ def add_or_rm_device_tags(
 
     devices = api_list_devices(tailnet, api_key)
 
-    matches = find_devices_by_devname(devices, device_ident)
+    matches = find_devices_by_ident(devices, device_ident)
     if not matches:
-        die(f"No device found matching {device_ident!r}. Use an exact device name (or its prefix) or numeric id.")
+        die(f"No device found matching {device_ident!r}. Use an exact device name (or numeric id).")
     if len(matches) > 1:
         ids = ", ".join(str(m.get("id")) for m in matches)
         die(f"Device identifier matched multiple devices (ids: {ids}). Use a numeric id.")
@@ -913,61 +1154,134 @@ def add_or_rm_device_tags(
     api_set_device_tags(dev_id, api_key, new_tags)
 
 
+def apply_pending_host_tag_changes(changes: List[PendingHostTagChange], tailnet: str, api_key: str) -> List[str]:
+    notes: List[str] = []
+    if not changes:
+        return notes
+
+    devices = api_list_devices(tailnet, api_key)
+
+    for ch in changes:
+        matches = find_devices_by_ident(devices, ch.host_ident)
+        if not matches:
+            die(f"No host device found matching {ch.host_ident!r} (for grant tagging).")
+        if len(matches) > 1:
+            ids = ", ".join(str(m.get("id")) for m in matches)
+            die(f"Host identifier {ch.host_ident!r} matched multiple devices (ids: {ids}). Use a numeric id.")
+
+        dev = matches[0]
+        dev_id = str(dev.get("id", "")).strip()
+        if not dev_id:
+            die(f"Host device {ch.host_ident!r} has no 'id' field; cannot tag.")
+
+        current = merge_tag_list(dev.get("tags", []))
+        add = [normalize_tag_selector(t) for t in ch.add_tags]
+        rem = [normalize_tag_selector(t) for t in ch.remove_tags]
+
+        new = sorted(set(current).union(add))
+        new = [t for t in new if t not in set(rem)]
+
+        if new == current:
+            continue
+
+        api_set_device_tags(dev_id, api_key, new)
+        display = dev.get("name") or dev.get("hostname") or ch.host_ident
+        if add:
+            notes.append(f"fix-grants: added {add} on host '{display}' (id {dev_id})")
+        if rem:
+            notes.append(f"fix-grants: removed {rem} on host '{display}' (id {dev_id})")
+
+    return notes
+
+
 # -----------------------------
 # Validation (read-only) + Fix
 # -----------------------------
 def collect_policy_issues(policy: Dict[str, Any]) -> List[Issue]:
     """
-    Read-only: detect missing service tags/grants based on the existing service model.
+    Read-only:
+      - Services must have ports (inferable from grants to tag:service-<service>)
+      - Grant tags must have matching per-client grants and correct ip
+      - If a grant tag refers to a missing service tag, error (not fixable)
     """
     ensure_policy_shape(policy)
     issues: List[Issue] = []
 
-    base_tags = list_base_tags(policy)
     services = list_services(policy)
     service_ip = infer_service_ip_from_grants(policy)
 
     for s in services:
         if s not in service_ip:
+            st = service_tag_for(s)
             issues.append(Issue(
                 kind="service-missing-ports",
-                msg=f"Service '{s}' has no inferable canonical ports (no existing grants for it).",
+                msg=f"Service '{s}' has no inferable canonical ports (no grants with dst [{st}] and ip).",
                 fixable=False,
                 data={"service": s},
             ))
 
-    for s in services:
-        ip = service_ip.get(s)
-        if not ip:
+    # Walk all grant tags we know about: from tagOwners and grants
+    grant_tags: set[str] = set()
+    for t in policy.get("tagOwners", {}).keys():
+        if parse_grant_tag(t):
+            grant_tags.add(normalize_tag_selector(t))
+    for g in policy.get("grants", []):
+        dsts = g.get("dst", [])
+        if isinstance(dsts, list) and len(dsts) == 1 and isinstance(dsts[0], str):
+            if parse_grant_tag(dsts[0]):
+                grant_tags.add(normalize_tag_selector(dsts[0]))
+
+    for gt in sorted(grant_tags):
+        parsed = parse_grant_tag(gt)
+        if not parsed:
+            continue
+        service, client_val = parsed
+        st = service_tag_for(service)
+
+        if st not in policy.get("tagOwners", {}):
+            issues.append(Issue(
+                kind="grant-missing-service",
+                msg=f"Grant tag {gt} refers to service '{service}', but {st} is not defined in tagOwners.",
+                fixable=False,
+                data={"grant_tag": gt, "service": service},
+            ))
             continue
 
-        for bt in base_tags:
-            bt_val = tag_value(bt)
-            st = service_tag_for(s, bt_val)
+        ip = service_ip.get(service)
+        if not ip:
+            # service-missing-ports already captured; don't duplicate too much
+            continue
 
-            if st not in policy["tagOwners"]:
-                issues.append(Issue(
-                    kind="missing-service-tag",
-                    msg=f"Missing tagOwners entry for {st} (service '{s}' x base '{bt}').",
-                    fixable=True,
-                    data={"service": s, "base": bt, "service_tag": st, "ip": ip},
-                ))
+        client_tag = normalize_tag_selector(client_val)
+        if client_tag not in policy.get("tagOwners", {}):
+            issues.append(Issue(
+                kind="grant-missing-client-tagowner",
+                msg=f"Grant tag {gt} refers to client tag {client_tag}, but it is not defined in tagOwners.",
+                fixable=False,
+                data={"grant_tag": gt, "client_tag": client_tag},
+            ))
+            continue
 
-            if not grant_exists(policy, bt, st, ip=ip):
-                issues.append(Issue(
-                    kind="missing-grant",
-                    msg=f"Missing grant {bt} -> {st} with ip={ip}.",
-                    fixable=True,
-                    data={"service": s, "base": bt, "service_tag": st, "ip": ip},
-                ))
+        if gt not in policy.get("tagOwners", {}):
+            issues.append(Issue(
+                kind="missing-grant-tagowner",
+                msg=f"Missing tagOwners entry for {gt}.",
+                fixable=True,
+                data={"tag": gt},
+            ))
+
+        if not grant_exists(policy, src=client_tag, dst=gt, ip=ip):
+            issues.append(Issue(
+                kind="missing-grant",
+                msg=f"Missing or mismatched grant {client_tag} -> {gt} with ip={ip} (should match service '{service}').",
+                fixable=True,
+                data={"src": client_tag, "dst": gt, "ip": ip},
+            ))
 
     return issues
 
 
 def apply_policy_fixes(policy: Dict[str, Any], owner_email: str, issues: List[Issue]) -> List[str]:
-    """
-    Mutates policy to repair fixable issues only. Returns notes.
-    """
     notes: List[str] = []
     ensure_policy_shape(policy)
 
@@ -975,26 +1289,23 @@ def apply_policy_fixes(policy: Dict[str, Any], owner_email: str, issues: List[Is
         if not iss.fixable or not iss.data:
             continue
 
-        if iss.kind in ("missing-service-tag", "missing-grant"):
-            st = iss.data["service_tag"]
-            bt = iss.data["base"]
+        if iss.kind == "missing-grant-tagowner":
+            tag = iss.data["tag"]
+            if tag not in policy["tagOwners"]:
+                policy["tagOwners"][tag] = [owner_email]
+                notes.append(f"fix: added tagOwner for {tag}")
+
+        if iss.kind == "missing-grant":
+            src = iss.data["src"]
+            dst = iss.data["dst"]
             ip = iss.data["ip"]
-
-            if st not in policy["tagOwners"]:
-                policy["tagOwners"][st] = [owner_email]
-                notes.append(f"fix: added tagOwner for {st}")
-
-            if not grant_exists(policy, bt, st, ip=ip):
-                upsert_grant(policy, src=bt, dst=st, ip=ip)
-                notes.append(f"fix: added grant {bt} -> {st} ({ip})")
+            upsert_grant(policy, src=src, dst=dst, ip=ip)
+            notes.append(f"fix: upserted grant {src} -> {dst} ({ip})")
 
     return notes
 
 
 def collect_devname_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: str) -> List[Issue]:
-    """
-    Read-only: for each devname tag in tagOwners, check if the matching device has that tag.
-    """
     ensure_policy_shape(policy)
     issues: List[Issue] = []
     devname_tags = list_devname_tags(policy)
@@ -1007,7 +1318,7 @@ def collect_devname_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: st
         v = tag_value(dt)                 # devname-xyz
         devname = v[len("devname-"):]     # xyz
 
-        matches = find_devices_by_devname(devices, devname)
+        matches = find_devices_by_ident(devices, devname)
         if not matches:
             issues.append(Issue(
                 kind="devname-no-device-match",
@@ -1052,9 +1363,6 @@ def collect_devname_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: st
 
 
 def apply_devname_tag_fixes(dev_issues: List[Issue], tailnet: str, api_key: str) -> List[str]:
-    """
-    Mutates devices (API calls) to apply missing devname tags. Returns notes.
-    """
     notes: List[str] = []
     if not dev_issues:
         return notes
@@ -1127,13 +1435,6 @@ def write_pair(out_dir: str, basename: str, stamp: Optional[str], before: Dict[s
 
 
 def resolve_out_target(out_arg: str) -> Tuple[str, str]:
-    """
-    If out_arg ends with .json/.json5 -> treat as a base filename:
-      --out tailnet.json  => out_dir=".", base="tailnet"
-      --out foo/bar.json  => out_dir="foo", base="bar"
-    Else treat as directory:
-      --out outdir        => out_dir="outdir", base=DEFAULT_OUT_BASENAME
-    """
     out_arg = out_arg.strip()
     if out_arg.lower().endswith((".json", ".json5")):
         out_dir = os.path.dirname(out_arg) or "."
@@ -1162,27 +1463,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--api-key", default=cfg_get("TAILSCALE_API_KEY", DEFAULT_API_KEY), help="API key.")
     p.add_argument("--owner", default=cfg_get("TAILSCALE_OWNER_EMAIL", DEFAULT_OWNER_EMAIL), help="Owner email for tagOwners.")
 
+    # Policy toggles
+    p.add_argument("--allow-all",dest="allow_all",choices=("yes", "no"),default=None,help="If 'yes', ensure an allow-all grant is present at the top of grants. If 'no', remove it. Omitted = no change.",
+    )
+    
+
     # Validation / fixing
     p.add_argument("--validate", action="store_true", help="Run validation checks (read-only). (Also runs by default.)")
     p.add_argument("--fix", action="store_true", help="Apply fixes for fixable validation issues (policy/devices).")
     p.add_argument("--validate-remote", action="store_true", help="Call Tailscale API /acl/validate (read-only).")
-
-    #Policy 
-    p.add_argument(
-    "--allow-all",
-    dest="allow_all",
-    choices=("yes", "no"),
-    default=None,
-    help="If 'yes', ensure an allow-all grant is present at the top of grants. If 'no', remove it. Omitted = no change.",)
-
+    p.add_argument("--grant-gc",action="store_true",help="Garbage-collect unused tag:grant-* tagOwners and their associated policy grants (requires API).",
+)
 
     # Devname tooling
-    p.add_argument(
-        "--gen-devname-tags",
-        action="store_true",
-        help="Generate expected tag:devname-* tagOwners entries from admin-console device names. "
-             "Read-only unless combined with --fix.",
-    )
+    p.add_argument("--gen-devname-tags",action="store_true",help="Generate expected tag:devname-* tagOwners entries from admin-console device names. " "Read-only unless combined with --fix.",)
     g = p.add_mutually_exclusive_group()
     g.add_argument("--autotag-devnames", dest="autotag_devnames", action="store_true",
                    help="Check devices for missing devname tags; apply during --fix.")
@@ -1196,14 +1490,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         nargs="+",
         metavar=("KIND", "..."),
-        help="Add: base <tags...> | service <name=ports> [name=ports ...] | tag <device> <tags_csv> (device tagging requires --fix).",
+        help="Add: base <tags...> | service <name=ports> [name=ports ...] | grant <host=client:svc,svc> [more...] | "
+             "tag <device> <tags_csv> (device tagging requires --fix).",
     )
     p.add_argument(
         "--rm",
         action="append",
         nargs="+",
         metavar=("KIND", "..."),
-        help="Remove: base <tags...> | service <name> | tag <device> <tags_csv> (device tagging requires --fix).",
+        help="Remove: base <tags...> | service <name> | grant <host=client:svc,svc> [more...] | "
+             "tag <device> <tags_csv> (device tagging requires --fix).",
     )
 
     return p
@@ -1230,7 +1526,11 @@ def main() -> None:
     if not args.infile and not args.pull:
         die("You must provide --in FILE or --pull for input.")
 
-    needs_api = bool(args.pull or args.push or args.validate_remote or args.autotag_devnames or args.gen_devname_tags)
+    add_ops = args.add or []
+    rm_ops = args.rm or []
+
+    ops_need_api = any(op and op[0].lower() in ("tag", "grant") for op in (add_ops + rm_ops))
+    needs_api = bool(args.pull or args.push or args.validate_remote or args.autotag_devnames or args.gen_devname_tags or args.grant_gc or ops_need_api)
     if needs_api:
         require_api_args(args.tailnet, args.api_key)
 
@@ -1242,11 +1542,21 @@ def main() -> None:
 
     ensure_policy_shape(policy_before)
     policy_after = copy.deepcopy(policy_before)
+    grant_gc_notes: List[str] = []
+
+
+    # Pending host device tag changes from --add/--rm grant (applied only during --fix)
+    pending_host_changes: Dict[str, PendingHostTagChange] = {}
+    # Grant tags created in this run (protect from GC until we've had a chance to apply them)
+    grant_gc_protect: set[str] = set()
+
+
+    def get_or_make_pending(host_ident: str) -> PendingHostTagChange:
+        if host_ident not in pending_host_changes:
+            pending_host_changes[host_ident] = PendingHostTagChange(host_ident=host_ident, add_tags=[], remove_tags=[])
+        return pending_host_changes[host_ident]
 
     # Apply ops (policy mutations; device tag ops require --fix)
-    add_ops = args.add or []
-    rm_ops = args.rm or []
-
     for op in add_ops:
         kind = op[0].lower()
         if kind == "base":
@@ -1258,6 +1568,18 @@ def main() -> None:
                 die("--add service requires: --add service <name=ports> [name=ports ...]")
             for svc_name, ports_spec in parse_service_specs(op[1:]):
                 add_service(policy_after, args.owner, svc_name, ports_spec)
+        elif kind == "grant":
+            # policy side is always updated; device tagging happens only with --fix
+            require_owner_email(args.owner)
+            if len(op) < 2:
+                die("--add grant requires: --add grant <host=client:svc,svc> [more...]")
+            for host, client_tag, svcs in parse_grant_specs(op[1:]):
+                for s in svcs:
+                    gt = ensure_grant_tag_and_rule(policy_after, args.owner, client_tag, s)
+                    pend = get_or_make_pending(host)
+                    pend.add_tags.append(gt)
+                    grant_gc_protect.add(gt)
+
         elif kind == "tag":
             if not args.fix:
                 die("--add tag changes device state; run with --fix to allow it.")
@@ -1284,6 +1606,18 @@ def main() -> None:
             if len(op) != 2:
                 die("--rm service requires: --rm service <name>")
             rm_service(policy_after, op[1])
+        elif kind == "grant":
+            if len(op) < 2:
+                die("--rm grant requires: --rm grant <host=client:svc,svc> [more...]")
+            for host, client_tag, svcs in parse_grant_specs(op[1:]):
+                # remove host tag(s); policy cleanup is intentionally conservative
+                for s in svcs:
+                    # verify service exists to catch typos
+                    _ = service_ports_or_die(policy_after, s)
+                    client_val = tag_value(client_tag)
+                    gt = grant_tag_for(s, client_val)
+                    pend = get_or_make_pending(host)
+                    pend.remove_tags.append(gt)
         elif kind == "tag":
             if not args.fix:
                 die("--rm tag changes device state; run with --fix to allow it.")
@@ -1301,7 +1635,8 @@ def main() -> None:
             )
         else:
             die(f"Unknown --rm kind: {kind!r}")
-    # Optional: enforce/strip allow-all grant (policy edit)
+
+    # Optional: enforce/strip allow-all grant
     allow_all_notes = apply_allow_all_setting(policy_after, args.allow_all)
     if args.allow_all is not None and allow_all_notes:
         print(f"allow-all: {', '.join(allow_all_notes)}")
@@ -1325,56 +1660,79 @@ def main() -> None:
         dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, args.api_key)
 
     fix_notes: List[str] = []
-    pushed_policy_early = False  # PATCH: if we must push tagOwners before tagging devices
+    pushed_policy_early = False
 
     # Fix (mutations) if requested
     if args.fix:
         # Any fixes that write tagOwners require owner email
-        if (args.gen_devname_tags and gen_issues) or any(i.kind in ("missing-service-tag", "missing-grant") for i in policy_issues):
+        if gen_issues or any(i.fixable for i in policy_issues):
             require_owner_email(args.owner)
 
-        # 1) Policy-side fixes first (this can create devname tags)
+        # 1) Policy-side fixes first
         if args.gen_devname_tags and gen_issues:
             fix_notes.extend(apply_missing_devname_tagowners(policy_after, args.owner, gen_issues))
 
         if policy_issues:
             fix_notes.extend(apply_policy_fixes(policy_after, args.owner, policy_issues))
 
-        # 2) Now that policy/tagOwners may have changed, re-collect dev issues
+        # Re-collect after policy fixes (before device operations)
+        gen_issues = collect_missing_devname_tagowners(policy_after, desired_devname_tags) if args.gen_devname_tags else []
+        policy_issues = collect_policy_issues(policy_after) + gen_issues
+
+        # 2) Device-side fixes: devname autotag
         if args.autotag_devnames:
             dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, args.api_key)
 
-            # PATCH: If we need to apply tags to devices, those tags must already exist
-            # in the CURRENTLY APPLIED tailnet policy. If not, push policy first (if allowed).
-            need_tags = sorted({
-                iss.data["tag"]
-                for iss in dev_issues
-                if iss.kind == "devname-tag-missing-on-device" and iss.data and "tag" in iss.data
-            })
+        # 3) Device-side changes for grants (pending host tagging)
+        pending_changes_list = list(pending_host_changes.values())
+        pending_add_tags = sorted(set(t for ch in pending_changes_list for t in ch.add_tags))
 
-            if need_tags:
+        # If we need to add tags to devices, the remote policy must already know those tags.
+        # We'll push policy early ONLY if:
+        #   - user requested --push (so we are allowed to write),
+        #   - policy issues are clean (so we won't push broken policy),
+        #   - and the tags are missing remotely.
+        if (args.autotag_devnames and any(i.kind == "devname-tag-missing-on-device" for i in dev_issues)) or pending_add_tags:
+            # Determine which tags we might apply to devices in this run
+            tags_to_apply = set(pending_add_tags)
+            if args.autotag_devnames:
+                for i in dev_issues:
+                    if i.kind == "devname-tag-missing-on-device" and i.data and "tag" in i.data:
+                        tags_to_apply.add(normalize_tag_selector(i.data["tag"]))
+
+            if tags_to_apply:
                 remote_policy = policy_before if args.pull else api_pull_policy(args.tailnet, args.api_key)
-                remote_tagowners = remote_policy.get("tagOwners", {}) or {}
+                remote_tagowners = set((remote_policy.get("tagOwners") or {}).keys())
+                missing_remote = sorted(t for t in tags_to_apply if t not in remote_tagowners)
 
-                missing_remote = [t for t in need_tags if t not in remote_tagowners]
                 if missing_remote:
                     if not args.push:
                         fix_notes.append(
-                            "fix-devnames: skipped device tagging because required devname tags are not yet present "
-                            "in the active tailnet policy (run again with --push, or push policy first)."
+                            f"fix-note: need policy pushed before device tagging (missing remote tagOwners for {missing_remote}); "
+                            f"skipping device tagging because --push was not set"
                         )
+                        # If we can't push, don't attempt device mutations
+                        dev_issues = []
+                        pending_host_changes = {}
                     else:
-                        # Push policy FIRST so the device-tag API will permit those tags.
+                        if policy_issues:
+                            die(
+                                "Refusing to push policy early for device tagging because policy validation issues remain. "
+                                "Fix policy issues first, then re-run with --fix --push."
+                            )
                         api_validate_policy(args.tailnet, args.api_key, policy_after)
                         api_push_policy(args.tailnet, args.api_key, policy_after)
                         pushed_policy_early = True
-                        fix_notes.append(
-                            f"fix-devnames: pushed policy early to permit device tagging (missing tags: {missing_remote})"
-                        )
+                        fix_notes.append(f"fix-note: pushed policy early to permit device tagging for tags: {missing_remote}")
+                        
 
-                # 3) Apply device tagging fixes (only if we didn't skip)
-                if dev_issues and (not missing_remote or args.push):
-                    fix_notes.extend(apply_devname_tag_fixes(dev_issues, args.tailnet, args.api_key))
+        # Apply grant host tag changes (if still present)
+        if pending_host_changes:
+            fix_notes.extend(apply_pending_host_tag_changes(list(pending_host_changes.values()), args.tailnet, args.api_key))
+
+        # Apply devname tagging fixes (if enabled)
+        if args.autotag_devnames and dev_issues:
+            fix_notes.extend(apply_devname_tag_fixes(dev_issues, args.tailnet, args.api_key))
 
         # 4) Re-run checks after fixing
         gen_issues = collect_missing_devname_tagowners(policy_after, desired_devname_tags) if args.gen_devname_tags else []
@@ -1385,16 +1743,12 @@ def main() -> None:
     if args.validate_remote:
         api_validate_policy(args.tailnet, args.api_key, policy_after)
 
-    # Output pair
+    # Output pair (default to ~/.config/.../logs, timestamped)
     stamp = utc_stamp()
     want_pair = bool(args.outdir) or WRITE_TIMESTAMPED_PAIR_BY_DEFAULT
     if want_pair:
-        # Default output directory is ~/.config/mech-goodies/tailscale/logs/
         out_dir, base = resolve_out_target(args.outdir or DEFAULT_LOG_DIR)
-
-        # If user didn't specify --out, default to timestamped to avoid overwrites
         use_stamp = args.stamp or (args.outdir is None)
-
         in_path, out_path = write_pair(
             out_dir=out_dir,
             basename=base,
@@ -1403,7 +1757,6 @@ def main() -> None:
             after=policy_after,
         )
         print(f"Wrote policy pair:\n  {in_path}\n  {out_path}")
-
 
     all_issues = policy_issues + dev_issues
 
@@ -1429,19 +1782,22 @@ def main() -> None:
         print("\nFix notes:")
         for n in fix_notes:
             print(f"  - {n}")
+    if grant_gc_notes:
+        if not fix_notes:
+            print("\nFix notes:")
+        for n in grant_gc_notes:
+            print(f"  - {n}")
 
-    # Push (only if clean)
+    # Push (only if clean). If we pushed early, only push again if policy differs (we don't track diffs; keep simple).
     if args.push:
         if all_issues:
             die("Refusing to --push: validation issues remain. Re-run with --fix (and/or fix manually).", code=3)
-
-        # PATCH: If we already pushed earlier (to permit device tagging), don't push again.
         if not pushed_policy_early:
             api_validate_policy(args.tailnet, args.api_key, policy_after)
             api_push_policy(args.tailnet, args.api_key, policy_after)
             print("Pushed policy successfully.")
         else:
-            print("Policy was already pushed earlier (to permit device tagging).")
+            print("Policy already pushed earlier during --fix to permit device tagging; no further policy push needed.")
 
     # Exit code: nonzero if issues remain
     if all_issues:
