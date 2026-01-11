@@ -10,7 +10,25 @@ What it does:
 - --fix: apply fixes (policy edits and/or device tag edits), then re-validate
 - --validate-remote: call Tailscale /acl/validate (read-only)
 - --push: push policy back to the tailnet (only if validation is clean)
-- --allow-all=(yes,no): yes ensures an allow-all grant exists at the top of "grants"; no removes it. Omitted = no change.
+- --allow-all=(yes,no): yes ensures an allow-all grant exists at the top of "grants";
+  no ensures there isn't. Omitted = no change.
+
+Adding services:
+- --add service <name=ports> [name=ports ...]
+  Example:
+    --add service sonarr=8989 radarr=7878 jellyfin=8096,8920
+
+Ports spec syntax (for name=ports):
+- Commas separate tokens only.
+- Tokens can be:
+    443              (expands to tcp:443 and udp:443)
+    443/tcp          (tcp only)
+    53/udp           (udp only)
+    80-443           (expands to tcp:80-443 and udp:80-443)
+    10000:10100      (range; ':' normalized to '-'; expands to tcp+udp)
+- Advanced: you may also directly specify capability selectors:
+    tcp:443,udp:53,tcp:80-443,icmp:*
+  (Do not combine these with /tcp or /udp on the same token.)
 
 Devname workflow:
 - --gen-devname-tags:
@@ -19,6 +37,7 @@ Devname workflow:
 - --autotag-devnames:
     - validate: detect devices missing their tag:devname-<device> tag
     - fix: apply missing devname tags to devices via API
+    - note: device tagging may require pushing policy first so tagOwners exist remotely
 
 Config precedence for tailnet/api-key/owner:
 1) CLI flags
@@ -35,6 +54,7 @@ tailscale.env example:
 Dependencies:
   pip install requests json5
 """
+
 
 from __future__ import annotations
 
@@ -210,6 +230,23 @@ def apply_allow_all_setting(policy: Dict[str, Any], mode: Optional[str]) -> List
     die("--allow-all must be 'yes' or 'no' (or omitted).")
     return []
 
+def parse_service_specs(tokens: Sequence[str]) -> List[Tuple[str, str]]:
+    """
+    Parse tokens like:
+      ["sonarr=8989", "radarr=7878", "jellyfin=8096,8920", "foo=8000-8100"]
+    Returns list of (service, ports_spec).
+    """
+    specs: List[Tuple[str, str]] = []
+    for tok in tokens:
+        if "=" not in tok:
+            die(f"--add service expects name=ports tokens, got: {tok!r}")
+        name, ports = tok.split("=", 1)
+        name = name.strip()
+        ports = ports.strip()
+        if not name or not ports:
+            die(f"Invalid service spec {tok!r}. Expected name=ports.")
+        specs.append((name, ports))
+    return specs
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -256,11 +293,18 @@ def is_base_tag_selector(tag_selector: str) -> bool:
 
 def parse_ports_spec(ports_spec: str) -> List[str]:
     """
-    Input: "8000,9000-9100,9443,10000:10100"
-    Output: ["8000","9000-9100","9443","10000-10100"]
+    Input examples:
+      "8989"                  -> ["tcp:8989","udp:8989"]
+      "8989/tcp"              -> ["tcp:8989"]
+      "7878/udp"              -> ["udp:7878"]
+      "80-443"                -> ["tcp:80-443","udp:80-443"]
+      "10000:10100/tcp"       -> ["tcp:10000-10100"]
+      "tcp:443,udp:53"        -> ["tcp:443","udp:53"]          (pass-through)
+      "*", "*/tcp", "*/udp"   -> ["*"], ["tcp:*"], ["udp:*"]
 
     Only commas separate tokens.
-    Port ranges accept '-' or ':' in input (':' is normalized to '-').
+    Port ranges accept '-' or ':' in input (':' normalized to '-').
+    Bare ports/ranges default to BOTH tcp+udp (least-privilege; avoids the implicit ICMP that "<port>" would allow).
     """
     raw = ports_spec.strip()
     if not raw:
@@ -268,33 +312,87 @@ def parse_ports_spec(ports_spec: str) -> List[str]:
 
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     out: List[str] = []
+    seen: set[str] = set()
 
-    for p in parts:
-        if ":" in p and "-" not in p:
-            a, b = p.split(":", 1)
-            p = f"{a}-{b}"
+    def emit(s: str) -> None:
+        if s not in seen:
+            out.append(s)
+            seen.add(s)
 
-        if re.fullmatch(r"\d{1,5}", p):
-            port = int(p)
-            if not (1 <= port <= 65535):
-                die(f"Port out of range: {port}")
-            out.append(str(port))
+    def validate_port(n: int) -> None:
+        if not (1 <= n <= 65535):
+            die(f"Port out of range: {n}")
+
+    for tok in parts:
+        # Optional suffix: /tcp or /udp (we only support these as requested)
+        proto_suffix: Optional[str] = None
+        if "/" in tok:
+            base, suf = tok.rsplit("/", 1)
+            base = base.strip()
+            suf = suf.strip().lower()
+            if suf not in ("tcp", "udp"):
+                die(f"Invalid protocol suffix {suf!r} in {tok!r}. Use /tcp or /udp.")
+            proto_suffix = suf
+            tok = base
+
+        tok = tok.strip()
+        if not tok:
+            die("Empty token in ports spec.")
+
+        # Allow direct capability selectors (pass-through), e.g. tcp:443, udp:53, icmp:*, tcp:80-443
+        # (If user writes these, they must NOT also use /tcp or /udp.)
+        mcap = re.fullmatch(r"([a-z0-9]+):(\*|\d{1,5}|\d{1,5}-\d{1,5})", tok.lower())
+        if mcap:
+            if proto_suffix is not None:
+                die(f"Do not combine proto selectors like {tok!r} with /tcp or /udp.")
+            emit(tok.lower())
             continue
 
-        m = re.fullmatch(r"(\d{1,5})-(\d{1,5})", p)
+        # Allow "*" optionally scoped by /tcp or /udp
+        if tok == "*":
+            if proto_suffix is None:
+                emit("*")
+            else:
+                emit(f"{proto_suffix}:*")
+            continue
+
+        # Normalize ":" to "-" for ranges like 10000:10100
+        if ":" in tok and "-" not in tok:
+            a, b = tok.split(":", 1)
+            tok = f"{a}-{b}"
+
+        # Parse single port
+        if re.fullmatch(r"\d{1,5}", tok):
+            port = int(tok)
+            validate_port(port)
+            if proto_suffix is None:
+                emit(f"tcp:{port}")
+                emit(f"udp:{port}")
+            else:
+                emit(f"{proto_suffix}:{port}")
+            continue
+
+        # Parse port range
+        m = re.fullmatch(r"(\d{1,5})-(\d{1,5})", tok)
         if m:
             a = int(m.group(1))
             b = int(m.group(2))
-            if not (1 <= a <= 65535 and 1 <= b <= 65535):
-                die(f"Port range out of bounds: {p}")
+            validate_port(a)
+            validate_port(b)
             if a > b:
-                die(f"Port range start greater than end: {p}")
-            out.append(f"{a}-{b}")
+                die(f"Port range start greater than end: {tok}")
+            rng = f"{a}-{b}"
+            if proto_suffix is None:
+                emit(f"tcp:{rng}")
+                emit(f"udp:{rng}")
+            else:
+                emit(f"{proto_suffix}:{rng}")
             continue
 
-        die(f"Invalid port token {p!r}. Use '443' or '80-443' (or '80:443').")
+        die(f"Invalid port token {tok!r}. Use '443', '80-443', '80:443', '8989/tcp', or 'udp:53'.")
 
     return out
+
 
 
 def parse_tags_csv(tags_csv: str) -> List[str]:
@@ -1098,7 +1196,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         nargs="+",
         metavar=("KIND", "..."),
-        help="Add: base <tags...> | service <name> <ports> | tag <device> <tags_csv> (device tagging requires --fix).",
+        help="Add: base <tags...> | service <name=ports> [name=ports ...] | tag <device> <tags_csv> (device tagging requires --fix).",
     )
     p.add_argument(
         "--rm",
@@ -1156,9 +1254,10 @@ def main() -> None:
             add_base(policy_after, args.owner, op[1:])
         elif kind == "service":
             require_owner_email(args.owner)
-            if len(op) != 3:
-                die("--add service requires: --add service <name> <ports>")
-            add_service(policy_after, args.owner, op[1], op[2])
+            if len(op) < 2:
+                die("--add service requires: --add service <name=ports> [name=ports ...]")
+            for svc_name, ports_spec in parse_service_specs(op[1:]):
+                add_service(policy_after, args.owner, svc_name, ports_spec)
         elif kind == "tag":
             if not args.fix:
                 die("--add tag changes device state; run with --fix to allow it.")
