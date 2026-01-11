@@ -29,7 +29,7 @@ tailscale.env example:
   # comments ok
   TAILSCALE_API_KEY=tskey-api-xxxxxxxx
   TAILSCALE_TAILNET=-
-  TAILSCALE_OWNER_EMAIL=mschuett@oniimediaworks.com
+  TAILSCALE_OWNER_EMAIL=me@example.com
 
 Dependencies:
   pip install requests json5
@@ -61,7 +61,8 @@ DEFAULT_OWNER_EMAIL = ""      # intentionally blank: must be provided via env fi
 MECH_ENV_PATH = os.path.expanduser("~/.config/mech-goodies/tailscale.env")
 
 # Output behavior
-WRITE_TIMESTAMPED_PAIR_BY_DEFAULT = False
+DEFAULT_LOG_DIR = os.path.expanduser("~/.config/mech-goodies/tailscale/logs")
+WRITE_TIMESTAMPED_PAIR_BY_DEFAULT = True
 DEFAULT_OUT_BASENAME = "tailnet-policy"
 
 API_BASE = "https://api.tailscale.com"
@@ -645,13 +646,17 @@ def rm_base(policy: Dict[str, Any], tags: Sequence[str]) -> None:
     for g in policy.get("grants", []):
         srcs = g.get("src", [])
         dsts = g.get("dst", [])
-        if not srcs or not dsts:
+
+        if not isinstance(srcs, list) or not isinstance(dsts, list) or not srcs or not dsts:
             kept.append(g)
             continue
-        if srcs == [s] and s in base_set:
+
+        if len(srcs) == 1 and srcs[0] in base_set:
             continue
-        if isinstance(dsts, list) and len(dsts) == 1 and is_service_for_removed_base(dsts[0]):
+
+        if len(dsts) == 1 and is_service_for_removed_base(dsts[0]):
             continue
+
         kept.append(g)
     policy["grants"] = kept
 
@@ -1120,7 +1125,6 @@ def main() -> None:
     desired_devname_tags: List[str] = []
     gen_notes: List[str] = []
     gen_issues: List[Issue] = []
-    devices_cache: List[Dict[str, Any]] = []
 
     if args.gen_devname_tags:
         devices_cache = api_list_devices(args.tailnet, args.api_key)
@@ -1136,6 +1140,7 @@ def main() -> None:
         dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, args.api_key)
 
     fix_notes: List[str] = []
+    pushed_policy_early = False  # PATCH: if we must push tagOwners before tagging devices
 
     # Fix (mutations) if requested
     if args.fix:
@@ -1143,16 +1148,50 @@ def main() -> None:
         if (args.gen_devname_tags and gen_issues) or any(i.kind in ("missing-service-tag", "missing-grant") for i in policy_issues):
             require_owner_email(args.owner)
 
+        # 1) Policy-side fixes first (this can create devname tags)
         if args.gen_devname_tags and gen_issues:
             fix_notes.extend(apply_missing_devname_tagowners(policy_after, args.owner, gen_issues))
 
         if policy_issues:
             fix_notes.extend(apply_policy_fixes(policy_after, args.owner, policy_issues))
 
-        if args.autotag_devnames and dev_issues:
-            fix_notes.extend(apply_devname_tag_fixes(dev_issues, args.tailnet, args.api_key))
+        # 2) Now that policy/tagOwners may have changed, re-collect dev issues
+        if args.autotag_devnames:
+            dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, args.api_key)
 
-        # Re-run checks after fixing
+            # PATCH: If we need to apply tags to devices, those tags must already exist
+            # in the CURRENTLY APPLIED tailnet policy. If not, push policy first (if allowed).
+            need_tags = sorted({
+                iss.data["tag"]
+                for iss in dev_issues
+                if iss.kind == "devname-tag-missing-on-device" and iss.data and "tag" in iss.data
+            })
+
+            if need_tags:
+                remote_policy = policy_before if args.pull else api_pull_policy(args.tailnet, args.api_key)
+                remote_tagowners = remote_policy.get("tagOwners", {}) or {}
+
+                missing_remote = [t for t in need_tags if t not in remote_tagowners]
+                if missing_remote:
+                    if not args.push:
+                        fix_notes.append(
+                            "fix-devnames: skipped device tagging because required devname tags are not yet present "
+                            "in the active tailnet policy (run again with --push, or push policy first)."
+                        )
+                    else:
+                        # Push policy FIRST so the device-tag API will permit those tags.
+                        api_validate_policy(args.tailnet, args.api_key, policy_after)
+                        api_push_policy(args.tailnet, args.api_key, policy_after)
+                        pushed_policy_early = True
+                        fix_notes.append(
+                            f"fix-devnames: pushed policy early to permit device tagging (missing tags: {missing_remote})"
+                        )
+
+                # 3) Apply device tagging fixes (only if we didn't skip)
+                if dev_issues and (not missing_remote or args.push):
+                    fix_notes.extend(apply_devname_tag_fixes(dev_issues, args.tailnet, args.api_key))
+
+        # 4) Re-run checks after fixing
         gen_issues = collect_missing_devname_tagowners(policy_after, desired_devname_tags) if args.gen_devname_tags else []
         policy_issues = collect_policy_issues(policy_after) + gen_issues
         dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, args.api_key) if args.autotag_devnames else []
@@ -1165,8 +1204,12 @@ def main() -> None:
     stamp = utc_stamp()
     want_pair = bool(args.outdir) or WRITE_TIMESTAMPED_PAIR_BY_DEFAULT
     if want_pair:
-        out_dir, base = resolve_out_target(args.outdir or ".")
-        use_stamp = args.stamp or (args.outdir is None and WRITE_TIMESTAMPED_PAIR_BY_DEFAULT)
+        # Default output directory is ~/.config/mech-goodies/tailscale/logs/
+        out_dir, base = resolve_out_target(args.outdir or DEFAULT_LOG_DIR)
+
+        # If user didn't specify --out, default to timestamped to avoid overwrites
+        use_stamp = args.stamp or (args.outdir is None)
+
         in_path, out_path = write_pair(
             out_dir=out_dir,
             basename=base,
@@ -1176,7 +1219,7 @@ def main() -> None:
         )
         print(f"Wrote policy pair:\n  {in_path}\n  {out_path}")
 
-    # Reporting
+
     all_issues = policy_issues + dev_issues
 
     if args.gen_devname_tags:
@@ -1206,9 +1249,14 @@ def main() -> None:
     if args.push:
         if all_issues:
             die("Refusing to --push: validation issues remain. Re-run with --fix (and/or fix manually).", code=3)
-        api_validate_policy(args.tailnet, args.api_key, policy_after)
-        api_push_policy(args.tailnet, args.api_key, policy_after)
-        print("Pushed policy successfully.")
+
+        # PATCH: If we already pushed earlier (to permit device tagging), don't push again.
+        if not pushed_policy_early:
+            api_validate_policy(args.tailnet, args.api_key, policy_after)
+            api_push_policy(args.tailnet, args.api_key, policy_after)
+            print("Pushed policy successfully.")
+        else:
+            print("Policy was already pushed earlier (to permit device tagging).")
 
     # Exit code: nonzero if issues remain
     if all_issues:
@@ -1217,4 +1265,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
