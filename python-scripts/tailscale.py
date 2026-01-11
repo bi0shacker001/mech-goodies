@@ -10,6 +10,7 @@ What it does:
 - --fix: apply fixes (policy edits and/or device tag edits), then re-validate
 - --validate-remote: call Tailscale /acl/validate (read-only)
 - --push: push policy back to the tailnet (only if validation is clean)
+- --allow-all=(yes,no): yes ensures an allow-all grant exists at the top of "grants"; no removes it. Omitted = no change.
 
 Devname workflow:
 - --gen-devname-tags:
@@ -137,6 +138,78 @@ def cfg_get(key: str, default: str) -> str:
 # -----------------------------
 def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+
+ALLOW_ALL_GRANT = {"src": ["*"], "dst": ["*"], "ip": ["*"]}
+
+
+def is_allow_all_grant(g: Any) -> bool:
+    """
+    Detect the canonical allow-all grant:
+      {"src":["*"],"dst":["*"],"ip":["*"]}
+    We intentionally ignore ordering in the dict and tolerate extra keys only if they are empty/absent.
+    """
+    if not isinstance(g, dict):
+        return False
+    if g.get("src") != ["*"] or g.get("dst") != ["*"] or g.get("ip") != ["*"]:
+        return False
+
+    # If someone made a "mostly allow all but with app/via/posture", don't treat it as the canonical allow-all.
+    for k in ("app", "via", "srcPosture"):
+        if k in g and g.get(k):
+            return False
+
+    return True
+
+
+def apply_allow_all_setting(policy: Dict[str, Any], mode: Optional[str]) -> List[str]:
+    """
+    mode:
+      - "yes": ensure allow-all grant exists and is the first grant
+      - "no": ensure no allow-all grant exists
+      - None: do nothing
+    Returns human-friendly notes about what changed.
+    """
+    if mode is None:
+        return []
+
+    ensure_policy_shape(policy)
+
+    if not isinstance(policy.get("grants"), list):
+        policy["grants"] = []
+
+    grants: List[Dict[str, Any]] = policy["grants"]
+    allow_all = [g for g in grants if is_allow_all_grant(g)]
+    others = [g for g in grants if not is_allow_all_grant(g)]
+
+    notes: List[str] = []
+
+    if mode == "yes":
+        if allow_all:
+            keep = allow_all[0]
+            if grants and grants[0] is keep:
+                notes.append("already present at top")
+            else:
+                notes.append("moved to top")
+            if len(allow_all) > 1:
+                notes.append(f"removed {len(allow_all) - 1} duplicate(s)")
+        else:
+            keep = copy.deepcopy(ALLOW_ALL_GRANT)
+            notes.append("added")
+
+        policy["grants"] = [keep] + others
+        return notes
+
+    if mode == "no":
+        if allow_all:
+            policy["grants"] = others
+            notes.append(f"removed {len(allow_all)}")
+        else:
+            notes.append("already absent")
+        return notes
+
+    die("--allow-all must be 'yes' or 'no' (or omitted).")
+    return []
+
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -996,6 +1069,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fix", action="store_true", help="Apply fixes for fixable validation issues (policy/devices).")
     p.add_argument("--validate-remote", action="store_true", help="Call Tailscale API /acl/validate (read-only).")
 
+    #Policy 
+    p.add_argument(
+    "--allow-all",
+    dest="allow_all",
+    choices=("yes", "no"),
+    default=None,
+    help="If 'yes', ensure an allow-all grant is present at the top of grants. If 'no', remove it. Omitted = no change.",)
+
+
     # Devname tooling
     p.add_argument(
         "--gen-devname-tags",
@@ -1120,6 +1202,10 @@ def main() -> None:
             )
         else:
             die(f"Unknown --rm kind: {kind!r}")
+    # Optional: enforce/strip allow-all grant (policy edit)
+    allow_all_notes = apply_allow_all_setting(policy_after, args.allow_all)
+    if args.allow_all is not None and allow_all_notes:
+        print(f"allow-all: {', '.join(allow_all_notes)}")
 
     # Optional: devname tagOwners generation checks
     desired_devname_tags: List[str] = []
