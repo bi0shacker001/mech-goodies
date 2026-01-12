@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 tailscale.py (Tailscale policy + tagging helper)
 
 What it does:
 - --pull: fetch current tailnet ACL policy JSON from the Tailscale API
 - --in: read a local policy file (JSON/JSON5/HuJSON-ish via json5)
-- --out: write a *pair* of files (pre/post) to disk (defaults to ~/.config/mech-goodies/tailscale/logs/)
-- --validate: run read-only checks (default behavior anyway)
-- --fix: apply fixes (policy edits and/or device tag edits), then re-validate
+- --out: write a pair of files (pre/post) to disk (defaults to ~/.config/mech-goodies/tailscale/logs/)
+- --validate: run read-only checks (also runs by default)
+- --fix: apply fixes (policy edits and/or *fix-mode* device edits), then re-validate
 - --validate-remote: call Tailscale /acl/validate (read-only)
 - --push: push updated policy back to the tailnet (only if validation is clean)
-- --allow-all=(yes,no): yes ensures an allow-all grant exists at the top of "grants";
-  no ensures there isn't. Omitted = no change.
-- --grant-gc: (optional) remove unused tag:grant-* tagOwners + their associated policy grants (requires API; apply with --fix)
+- --dry-run: do not push policy and do not modify device tags; print intended actions
+- --shell: start an interactive shell (REPL) to run operations without re-invoking the script each time
 
+Owner-tag safety rule (as requested):
+- Device tag operations do NOT require --fix, EXCEPT:
+  - removing an existing owner-* tag
+  - replacing/normalizing an existing owner-* tag
+  Those require: --fix --allow-owner-change
+- Adding a first owner-* tag to a device that currently has no owner-* is allowed without --fix.
 Services model:
 - A service is defined by a service tag:
     tag:service-<service>
@@ -78,6 +84,13 @@ tailscale.env example:
   TAILSCALE_TAILNET=-
   TAILSCALE_OWNER_EMAIL=admin@example.com
 
+
+Config precedence for tailnet/api-key/owner:
+1) CLI flags
+2) Environment variables
+3) ~/.config/mech-goodies/tailscale.env
+4) Hardcoded defaults below
+
 Dependencies:
   pip install requests json5
 """
@@ -85,10 +98,12 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import cmd
 import copy
 import json
 import os
 import re
+import shlex
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -135,6 +150,15 @@ class PendingHostTagChange:
     host_ident: str
     add_tags: List[str]
     remove_tags: List[str]
+
+
+@dataclass
+class PendingDeviceTagChange:
+    device_ident: str
+    add_tags: List[str]           # non-owner tags to add (tag:...)
+    remove_tags: List[str]        # non-owner tags to remove (tag:...)
+    requested_owner: Optional[str] = None  # tag:owner-... (at most one)
+    remove_owner: bool = False            # remove whatever owner-* exists (explicit request)
 
 
 # -----------------------------
@@ -197,6 +221,10 @@ def utc_stamp() -> str:
 def die(msg: str, code: int = 2) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def warn(msg: str) -> None:
+    print(f"WARNING: {msg}", file=sys.stderr)
 
 
 def parse_device_tag_specs(tokens: Sequence[str]) -> List[Tuple[str, str]]:
@@ -283,120 +311,6 @@ def normalize_grant_endpoint(sel: str) -> str:
 def normalize_ip_list(ip: List[str]) -> List[str]:
     # stable: unique then sort (string sort is fine for our canonical output)
     return sorted(set(ip))
-
-
-def list_grant_tags(policy: Dict[str, Any]) -> List[str]:
-    """
-    Collect all tag:grant-* tags referenced by policy, from:
-      - tagOwners keys
-      - grants[*].dst
-    """
-    ensure_policy_shape(policy)
-    found: set[str] = set()
-
-    for t in (policy.get("tagOwners") or {}).keys():
-        try:
-            ts = normalize_tag_selector(t)
-        except SystemExit:
-            continue
-        if parse_grant_tag(ts):
-            found.add(ts)
-
-    for g in policy.get("grants") or []:
-        dsts = g.get("dst", [])
-        if isinstance(dsts, list) and len(dsts) == 1 and isinstance(dsts[0], str):
-            try:
-                dst0 = normalize_tag_selector(dsts[0])
-            except SystemExit:
-                continue
-            if parse_grant_tag(dst0):
-                found.add(dst0)
-
-    return sorted(found)
-
-
-def collect_all_device_tags(tailnet: str, api_key: str) -> set[str]:
-    """
-    Union of all tags currently assigned to any device in the tailnet.
-    """
-    devices = api_list_devices(tailnet, api_key)
-    used: set[str] = set()
-    for d in devices:
-        for t in merge_tag_list(d.get("tags", [])):
-            used.add(t)
-    return used
-
-
-def collect_unused_grant_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: str) -> List[Issue]:
-    """
-    Read-only: report tag:grant-* tags that exist in policy but are not assigned to any device.
-    """
-    ensure_policy_shape(policy)
-    issues: List[Issue] = []
-
-    policy_grant_tags = list_grant_tags(policy)
-    if not policy_grant_tags:
-        return issues
-
-    used_device_tags = collect_all_device_tags(tailnet, api_key)
-
-    for gt in policy_grant_tags:
-        if gt not in used_device_tags:
-            issues.append(Issue(
-                kind="unused-grant-tag",
-                msg=f"Grant tag {gt} is not assigned to any device; safe to remove from tagOwners and policy grants.",
-                fixable=True,
-                data={"tag": gt},
-            ))
-
-    return issues
-
-
-def apply_grant_gc_fixes(policy: Dict[str, Any], issues: List[Issue]) -> List[str]:
-    """
-    Remove unused grant tags from:
-      - tagOwners
-      - policy grants where dst == [that tag]
-    Returns notes.
-    """
-    ensure_policy_shape(policy)
-    notes: List[str] = []
-
-    to_remove: set[str] = set()
-    for iss in issues:
-        if iss.fixable and iss.kind == "unused-grant-tag" and iss.data and "tag" in iss.data:
-            to_remove.add(normalize_tag_selector(iss.data["tag"]))
-
-    if not to_remove:
-        return notes
-
-    # Remove from tagOwners
-    for t in sorted(to_remove):
-        if t in policy["tagOwners"]:
-            policy["tagOwners"].pop(t, None)
-            notes.append(f"grant-gc: removed tagOwners entry for {t}")
-
-    # Remove from grants
-    kept: List[Dict[str, Any]] = []
-    removed_count = 0
-    for g in policy.get("grants", []):
-        dsts = g.get("dst", [])
-        if isinstance(dsts, list) and len(dsts) == 1 and isinstance(dsts[0], str):
-            try:
-                dst0 = normalize_tag_selector(dsts[0])
-            except SystemExit:
-                kept.append(g)
-                continue
-            if dst0 in to_remove:
-                removed_count += 1
-                continue
-        kept.append(g)
-
-    if removed_count:
-        notes.append(f"grant-gc: removed {removed_count} policy grant rule(s) targeting unused grant tags")
-
-    policy["grants"] = kept
-    return notes
 
 
 def parse_ports_spec(ports_spec: str) -> List[str]:
@@ -518,9 +432,20 @@ def ensure_policy_shape(policy: Dict[str, Any]) -> None:
 
 
 def set_tag_owner(policy: Dict[str, Any], tag_selector: str, owner_email: str) -> None:
+    """
+    Conservative behavior:
+    - If missing: set tagOwners[tag] = [owner_email]
+    - If present and different: keep existing, warn
+    """
     ensure_policy_shape(policy)
     ts = normalize_tag_selector(tag_selector)
-    policy["tagOwners"][ts] = [owner_email]
+    desired = [owner_email]
+    prior = policy["tagOwners"].get(ts)
+    if prior is None:
+        policy["tagOwners"][ts] = desired
+        return
+    if prior != desired:
+        warn(f"tagOwners for {ts} already exists and differs: {prior} (leaving unchanged)")
 
 
 def remove_tag_owner(policy: Dict[str, Any], tag_selector: str) -> None:
@@ -991,7 +916,170 @@ def apply_missing_devname_tagowners(policy: Dict[str, Any], owner_email: str, is
 
 
 # -----------------------------
-# Ops: add/rm base/service/tag/grant
+# Device tag ops (explicit --add/--rm tag)
+# -----------------------------
+def plan_device_tag_change(device_ident: str, tags_csv: str, *, remove: bool) -> PendingDeviceTagChange:
+    tags = parse_tags_csv(tags_csv)
+    owner_tags = [t for t in tags if is_owner_tag_selector(t)]
+    if len(owner_tags) > 1:
+        die(f"Refusing to specify multiple owner-* tags in one operation: {owner_tags}")
+
+    non_owner = [t for t in tags if not is_owner_tag_selector(t)]
+
+    if remove:
+        return PendingDeviceTagChange(
+            device_ident=device_ident,
+            add_tags=[],
+            remove_tags=non_owner,
+            requested_owner=None,
+            remove_owner=bool(owner_tags),
+        )
+
+    return PendingDeviceTagChange(
+        device_ident=device_ident,
+        add_tags=non_owner,
+        remove_tags=[],
+        requested_owner=owner_tags[0] if owner_tags else None,
+        remove_owner=False,
+    )
+
+
+def merge_pending_device_change(dst: PendingDeviceTagChange, src: PendingDeviceTagChange) -> None:
+    dst.add_tags.extend(src.add_tags)
+    dst.remove_tags.extend(src.remove_tags)
+
+    if src.remove_owner:
+        dst.remove_owner = True
+
+    if src.requested_owner:
+        if dst.requested_owner and dst.requested_owner != src.requested_owner:
+            die(
+                f"Conflicting owner-* requests for device {dst.device_ident!r}: "
+                f"{dst.requested_owner} vs {src.requested_owner}"
+            )
+        dst.requested_owner = src.requested_owner
+
+
+def apply_pending_device_tag_changes(
+    changes: List[PendingDeviceTagChange],
+    tailnet: str,
+    api_key: str,
+    *,
+    fix_enabled: bool,
+    allow_owner_change: bool,
+    dry_run: bool,
+    blocked_add_tags: Optional[set[str]] = None,
+) -> List[str]:
+    """
+    Apply device tag changes.
+    - Non-owner tags apply without --fix (unless --dry-run).
+    - Owner tag removals/replacements require --fix + --allow-owner-change.
+    - Adding a first owner-* tag is allowed without --fix.
+    """
+    notes: List[str] = []
+    if not changes:
+        return notes
+
+    blocked_add_tags = blocked_add_tags or set()
+
+    devices = api_list_devices(tailnet, api_key)
+
+    for ch in changes:
+        matches = find_devices_by_ident(devices, ch.device_ident)
+        if not matches:
+            die(f"No device found matching {ch.device_ident!r} (for tag ops).")
+        if len(matches) > 1:
+            ids = ", ".join(str(m.get("id")) for m in matches)
+            die(f"Device identifier matched multiple devices (ids: {ids}). Use a numeric id.")
+
+        dev = matches[0]
+        dev_id = str(dev.get("id", "")).strip()
+        if not dev_id:
+            die(f"Device {ch.device_ident!r} has no 'id' field; cannot tag.")
+
+        current = merge_tag_list(dev.get("tags", []))
+        current_owner = [t for t in current if is_owner_tag_selector(t)]
+
+        # Filter add-tags that are blocked because remote tagOwners is missing
+        add_non_owner = [t for t in ch.add_tags if t not in blocked_add_tags]
+        skipped_add = sorted(set(ch.add_tags) - set(add_non_owner))
+        if skipped_add:
+            notes.append(
+                f"device-tag: skipped adding {skipped_add} on '{ch.device_ident}' "
+                f"(missing remote tagOwners; push policy first)"
+            )
+
+        # Start with non-owner removals
+        remove_set = set(ch.remove_tags)
+        working = [t for t in current if t not in remove_set]
+
+        # Apply non-owner adds
+        working = sorted(set(working).union(add_non_owner))
+
+        # Owner removal intent: only if explicitly requested AND allowed
+        if ch.remove_owner and current_owner:
+            if (not fix_enabled) or (not allow_owner_change):
+                notes.append(
+                    f"owner-tag: would remove {current_owner} on device '{ch.device_ident}' "
+                    f"(skipped; requires --fix --allow-owner-change)"
+                )
+            else:
+                working = [t for t in working if not is_owner_tag_selector(t)]
+                notes.append(f"owner-tag: removed {current_owner} on device id {dev_id}")
+
+        # Owner set/replace intent
+        if ch.requested_owner:
+            if ch.requested_owner in blocked_add_tags:
+                notes.append(
+                    f"owner-tag: skipped adding {ch.requested_owner} on device '{ch.device_ident}' "
+                    f"(missing remote tagOwners; push policy first)"
+                )
+            else:
+                if not current_owner:
+                    # Adding first owner tag is allowed without --fix
+                    if ch.requested_owner not in working:
+                        working = sorted(set(working).union([ch.requested_owner]))
+                        notes.append(f"owner-tag: added {ch.requested_owner} on device id {dev_id}")
+                else:
+                    already_single_same = (len(current_owner) == 1 and current_owner[0] == ch.requested_owner)
+                    if not already_single_same:
+                        if (not fix_enabled) or (not allow_owner_change):
+                            notes.append(
+                                f"owner-tag: would replace {current_owner} -> {ch.requested_owner} on device '{ch.device_ident}' "
+                                f"(skipped; requires --fix --allow-owner-change)"
+                            )
+                        else:
+                            working = [t for t in working if not is_owner_tag_selector(t)]
+                            working = sorted(set(working).union([ch.requested_owner]))
+                            notes.append(f"owner-tag: replaced {current_owner} -> {ch.requested_owner} on device id {dev_id}")
+
+        new_tags = sorted(set(working))
+        if new_tags == current:
+            continue
+
+        added = sorted(set(new_tags) - set(current))
+        removed = sorted(set(current) - set(new_tags))
+
+        if dry_run:
+            notes.append(f"device-tag: would update '{ch.device_ident}' (id {dev_id}) add={added} remove={removed}")
+            continue
+
+        api_set_device_tags(dev_id, api_key, new_tags)
+        notes.append(f"device-tag: updated '{ch.device_ident}' (id {dev_id}) add={added} remove={removed}")
+
+    return notes
+
+
+def compute_missing_remote_tagowners(
+    tailnet: str, api_key: str, tags_to_apply: set[str]
+) -> List[str]:
+    remote_policy = api_pull_policy(tailnet, api_key)
+    remote_tagowners = set((remote_policy.get("tagOwners") or {}).keys())
+    return sorted(t for t in tags_to_apply if t not in remote_tagowners)
+
+
+# -----------------------------
+# Ops: add/rm base/service/grant
 # -----------------------------
 def add_base(policy: Dict[str, Any], owner_email: str, tags: Sequence[str]) -> None:
     if not tags:
@@ -1052,8 +1140,8 @@ def add_service(policy: Dict[str, Any], owner_email: str, service: str, ports_sp
 
     dups = find_service_definition_grants(policy, st)
     if len(dups) > 1:
-        print(
-            f"WARNING: service '{svc}' already has {len(dups)} global definition grants for dst [{st}]. "
+        warn(
+            f"service '{svc}' already has {len(dups)} global definition grants for dst [{st}]. "
             "Validation/--fix can deduplicate them."
         )
 
@@ -1172,132 +1260,13 @@ def ensure_grant_tag_and_rule(policy: Dict[str, Any], owner_email: str, client_t
     return gt
 
 
-def add_or_rm_device_tags(
-    policy: Dict[str, Any],
-    owner_email: str,
-    *,
+def apply_pending_host_tag_changes(
+    changes: List[PendingHostTagChange],
     tailnet: str,
     api_key: str,
-    device_ident: str,
-    tags_csv: str,
-    remove: bool,
-    allow_owner_change: bool,
-    fix_enabled: bool,
-) -> None:
-    """
-    Applies device tags if fix_enabled, otherwise prints a dry-run diff.
-
-    Note: This function also ensures the tags exist in tagOwners (policy side),
-    because Tailscale requires tagOwners for tagged nodes.
-    """
-    tags = parse_tags_csv(tags_csv)
-
-    # Ensure tags exist in tagOwners so they can be applied.
-    for t in tags:
-        set_tag_owner(policy, t, owner_email)
-
-    devices = api_list_devices(tailnet, api_key)
-
-    matches = find_devices_by_ident(devices, device_ident)
-    if not matches:
-        die(f"No device found matching {device_ident!r}. Use an exact device name (or numeric id).")
-    if len(matches) > 1:
-        ids = ", ".join(str(m.get("id")) for m in matches)
-        die(f"Device identifier matched multiple devices (ids: {ids}). Use a numeric id.")
-
-    dev = matches[0]
-    dev_id = str(dev.get("id", "")).strip()
-    if not dev_id:
-        die("Device record has no 'id' field; cannot tag.")
-
-    current_norm = merge_tag_list(dev.get("tags", []))
-
-    # Enforce: at most one owner-* in the *requested* tags
-    owner_requested = [t for t in tags if is_owner_tag_selector(t)]
-    if len(owner_requested) > 1:
-        die(f"Refusing to specify multiple owner-* tags in one operation: {owner_requested}")
-
-    # Identify current owner tags (could be 0 or >1 if already messy)
-    current_owner = [t for t in current_norm if is_owner_tag_selector(t)]
-
-    if remove:
-        # Only owner tag removals are gated. If not allowed, skip owner removal but still remove other tags.
-        removing_owner = any(is_owner_tag_selector(t) for t in tags)
-        if removing_owner and current_owner:
-            if not fix_enabled:
-                print(f"owner-tag: would remove {current_owner} from device '{device_ident}'")
-                tags = [t for t in tags if not is_owner_tag_selector(t)]
-            elif not allow_owner_change:
-                print(
-                    f"owner-tag: would remove {current_owner} from device '{device_ident}' "
-                    f"(skipped; missing --allow-owner-change)"
-                )
-                tags = [t for t in tags if not is_owner_tag_selector(t)]
-
-        new_tags = [t for t in current_norm if t not in tags]
-
-    else:
-        # Only owner tag replacement/normalization is gated. If not allowed, skip owner change but still add other tags.
-        if owner_requested:
-            new_owner = owner_requested[0]
-            replacing = any(t != new_owner for t in current_owner)
-            messy = len(current_owner) > 1
-
-            if current_owner and (replacing or messy):
-                if not fix_enabled:
-                    if replacing:
-                        print(f"owner-tag: would replace {current_owner} -> {new_owner} on device '{device_ident}'")
-                    else:
-                        print(
-                            f"owner-tag: would normalize multiple owners {current_owner} -> {new_owner} "
-                            f"on device '{device_ident}'"
-                        )
-                    tags = [t for t in tags if not is_owner_tag_selector(t)]
-
-                elif not allow_owner_change:
-                    if replacing:
-                        print(
-                            f"owner-tag: would replace {current_owner} -> {new_owner} on device '{device_ident}' "
-                            f"(skipped; missing --allow-owner-change)"
-                        )
-                    else:
-                        print(
-                            f"owner-tag: would normalize multiple owners {current_owner} -> {new_owner} "
-                            f"on device '{device_ident}' (skipped; missing --allow-owner-change)"
-                        )
-                    tags = [t for t in tags if not is_owner_tag_selector(t)]
-
-                else:
-                    if replacing:
-                        print(f"owner-tag: replacing {current_owner} -> {new_owner} on device '{device_ident}'")
-                    elif messy:
-                        print(
-                            f"owner-tag: normalizing multiple owners {current_owner} -> {new_owner} "
-                            f"on device '{device_ident}'"
-                        )
-
-                    # Allowed: enforce single owner by removing all existing owner tags
-                    current_norm = [t for t in current_norm if not is_owner_tag_selector(t)]
-
-        new_tags = sorted(set(current_norm).union(tags))
-
-    added = sorted(set(new_tags) - set(current_norm))
-    removed = sorted(set(current_norm) - set(new_tags))
-
-    if not fix_enabled:
-        if added or removed:
-            print(f"device-tag: would update '{device_ident}' (id {dev_id}) add={added} remove={removed}")
-        else:
-            print(f"device-tag: no changes for '{device_ident}' (id {dev_id})")
-        return
-
-    if new_tags == current_norm:
-        return
-
-    api_set_device_tags(dev_id, api_key, new_tags)
-
-
-def apply_pending_host_tag_changes(changes: List[PendingHostTagChange], tailnet: str, api_key: str) -> List[str]:
+    *,
+    dry_run: bool,
+) -> List[str]:
     notes: List[str] = []
     if not changes:
         return notes
@@ -1327,8 +1296,12 @@ def apply_pending_host_tag_changes(changes: List[PendingHostTagChange], tailnet:
         if new == current:
             continue
 
-        api_set_device_tags(dev_id, api_key, new)
         display = dev.get("name") or dev.get("hostname") or ch.host_ident
+        if dry_run:
+            notes.append(f"fix-grants: would update host '{display}' (id {dev_id}) add={sorted(set(add))} remove={sorted(set(rem))}")
+            continue
+
+        api_set_device_tags(dev_id, api_key, new)
         if add:
             notes.append(f"fix-grants: added {add} on host '{display}' (id {dev_id})")
         if rem:
@@ -1474,10 +1447,7 @@ def dedup_service_definition_grants_prompt(policy: Dict[str, Any], service: str)
         return []
 
     if not sys.stdin.isatty():
-        die(
-            f"Need interactive input to deduplicate service definition grants for '{svc}'. "
-            "Run in an interactive terminal, or deduplicate manually."
-        )
+        return [f"dedup-service: skipped '{svc}' (non-interactive; run in a TTY to choose keep/merge)"]
 
     print("")
     print(f"Service '{svc}' has {len(dups)} duplicate global definition grants (src ['*'] -> dst [{st}]).")
@@ -1572,6 +1542,12 @@ def apply_policy_fixes(policy: Dict[str, Any], owner_email: str, issues: List[Is
 
 
 def collect_devname_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: str) -> List[Issue]:
+    """
+    Validate that every devname tag in policy corresponds to exactly one device,
+    and that the device has that tag.
+    Matching is done by generating devname tags from canonical admin-console names,
+    not by trying to interpret "devname-..." as a literal device identifier.
+    """
     ensure_policy_shape(policy)
     issues: List[Issue] = []
     devname_tags = list_devname_tags(policy)
@@ -1580,17 +1556,24 @@ def collect_devname_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: st
 
     devices = api_list_devices(tailnet, api_key)
 
-    for dt in devname_tags:
-        v = tag_value(dt)                 # devname-xyz
-        devname = v[len("devname-"):]     # xyz
+    # Index: devname-tag -> devices
+    idx: Dict[str, List[Dict[str, Any]]] = {}
+    for d in devices:
+        raw = canonical_device_name(d)
+        if not raw:
+            continue
+        dt = devname_tag_for_device_name(raw)
+        idx.setdefault(dt, []).append(d)
 
-        matches = find_devices_by_ident(devices, devname)
+    for dt in devname_tags:
+        matches = idx.get(dt, [])
+
         if not matches:
             issues.append(Issue(
                 kind="devname-no-device-match",
-                msg=f"Devname tag {dt} has no matching device named '{devname}'.",
+                msg=f"Devname tag {dt} has no matching device (by canonical admin-console name).",
                 fixable=False,
-                data={"tag": dt, "devname": devname},
+                data={"tag": dt},
             ))
             continue
 
@@ -1598,9 +1581,9 @@ def collect_devname_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: st
             ids = [str(m.get("id")) for m in matches]
             issues.append(Issue(
                 kind="devname-ambiguous-device-match",
-                msg=f"Devname tag {dt} matches multiple devices for '{devname}': ids={ids}.",
+                msg=f"Devname tag {dt} matches multiple devices (collision): ids={ids}.",
                 fixable=False,
-                data={"tag": dt, "devname": devname, "ids": ids},
+                data={"tag": dt, "ids": ids},
             ))
             continue
 
@@ -1611,13 +1594,13 @@ def collect_devname_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: st
                 kind="devname-device-missing-id",
                 msg=f"Device matched for {dt} but has no id field; cannot tag it.",
                 fixable=False,
-                data={"tag": dt, "devname": devname},
+                data={"tag": dt},
             ))
             continue
 
         current = merge_tag_list(d.get("tags", []))
         if dt not in current:
-            display = d.get("name") or d.get("hostname") or devname
+            display = d.get("name") or d.get("hostname") or dev_id
             issues.append(Issue(
                 kind="devname-tag-missing-on-device",
                 msg=f"Device '{display}' (id {dev_id}) is missing tag {dt}.",
@@ -1628,7 +1611,7 @@ def collect_devname_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: st
     return issues
 
 
-def apply_devname_tag_fixes(dev_issues: List[Issue], tailnet: str, api_key: str) -> List[str]:
+def apply_devname_tag_fixes(dev_issues: List[Issue], tailnet: str, api_key: str, *, dry_run: bool) -> List[str]:
     notes: List[str] = []
     if not dev_issues:
         return notes
@@ -1659,9 +1642,131 @@ def apply_devname_tag_fixes(dev_issues: List[Issue], tailnet: str, api_key: str)
         if tag in current:
             continue
         new_tags = sorted(set(current + [tag]))
+
+        if dry_run:
+            notes.append(f"fix-devnames: would apply {tag} to device '{display}' (id {dev_id})")
+            continue
+
         api_set_device_tags(dev_id, api_key, new_tags)
         notes.append(f"fix-devnames: applied {tag} to device '{display}' (id {dev_id})")
 
+    return notes
+
+
+# -----------------------------
+# Grant GC (optional)
+# -----------------------------
+def list_grant_tags(policy: Dict[str, Any]) -> List[str]:
+    """
+    Collect all tag:grant-* tags referenced by policy, from:
+      - tagOwners keys
+      - grants[*].dst
+    """
+    ensure_policy_shape(policy)
+    found: set[str] = set()
+
+    for t in (policy.get("tagOwners") or {}).keys():
+        try:
+            ts = normalize_tag_selector(t)
+        except SystemExit:
+            continue
+        if parse_grant_tag(ts):
+            found.add(ts)
+
+    for g in policy.get("grants") or []:
+        dsts = g.get("dst", [])
+        if isinstance(dsts, list) and len(dsts) == 1 and isinstance(dsts[0], str):
+            try:
+                dst0 = normalize_tag_selector(dsts[0])
+            except SystemExit:
+                continue
+            if parse_grant_tag(dst0):
+                found.add(dst0)
+
+    return sorted(found)
+
+
+def collect_all_device_tags(tailnet: str, api_key: str) -> set[str]:
+    """
+    Union of all tags currently assigned to any device in the tailnet.
+    """
+    devices = api_list_devices(tailnet, api_key)
+    used: set[str] = set()
+    for d in devices:
+        for t in merge_tag_list(d.get("tags", [])):
+            used.add(t)
+    return used
+
+
+def collect_unused_grant_tag_issues(policy: Dict[str, Any], tailnet: str, api_key: str) -> List[Issue]:
+    """
+    Read-only: report tag:grant-* tags that exist in policy but are not assigned to any device.
+    """
+    ensure_policy_shape(policy)
+    issues: List[Issue] = []
+
+    policy_grant_tags = list_grant_tags(policy)
+    if not policy_grant_tags:
+        return issues
+
+    used_device_tags = collect_all_device_tags(tailnet, api_key)
+
+    for gt in policy_grant_tags:
+        if gt not in used_device_tags:
+            issues.append(Issue(
+                kind="unused-grant-tag",
+                msg=f"Grant tag {gt} is not assigned to any device; safe to remove from tagOwners and policy grants.",
+                fixable=True,
+                data={"tag": gt},
+            ))
+
+    return issues
+
+
+def apply_grant_gc_fixes(policy: Dict[str, Any], issues: List[Issue]) -> List[str]:
+    """
+    Remove unused grant tags from:
+      - tagOwners
+      - policy grants where dst == [that tag]
+    Returns notes.
+    """
+    ensure_policy_shape(policy)
+    notes: List[str] = []
+
+    to_remove: set[str] = set()
+    for iss in issues:
+        if iss.fixable and iss.kind == "unused-grant-tag" and iss.data and "tag" in iss.data:
+            to_remove.add(normalize_tag_selector(iss.data["tag"]))
+
+    if not to_remove:
+        return notes
+
+    # Remove from tagOwners
+    for t in sorted(to_remove):
+        if t in policy["tagOwners"]:
+            policy["tagOwners"].pop(t, None)
+            notes.append(f"grant-gc: removed tagOwners entry for {t}")
+
+    # Remove from grants
+    kept: List[Dict[str, Any]] = []
+    removed_count = 0
+    for g in policy.get("grants", []):
+        dsts = g.get("dst", [])
+        if isinstance(dsts, list) and len(dsts) == 1 and isinstance(dsts[0], str):
+            try:
+                dst0 = normalize_tag_selector(dsts[0])
+            except SystemExit:
+                kept.append(g)
+                continue
+            if dst0 in to_remove:
+                removed_count += 1
+                continue
+        kept.append(g)
+
+    if removed_count:
+        notes.append(f"grant-gc: removed {removed_count} policy grant rule(s) targeting unused grant tags")
+
+    policy["grants"] = kept
     return notes
 
 
@@ -1715,6 +1820,9 @@ def resolve_out_target(out_arg: str) -> Tuple[str, str]:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=True)
 
+    # Interactive
+    p.add_argument("--shell", action="store_true", help="Start an interactive shell (REPL).")
+
     # Input
     p.add_argument("--in", dest="infile", help="Read policy from a local file (JSON5/HuJSON ok).")
     p.add_argument("--pull", action="store_true", help="Pull current policy from your tailnet via API.")
@@ -1723,6 +1831,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", dest="outdir", help="Write a pair of files (pre/post patch) to this directory or base file.")
     p.add_argument("--stamp", action="store_true", help="Use timestamped filenames for the --out pair.")
     p.add_argument("--push", action="store_true", help="Push updated policy to your tailnet via API (requires clean validation).")
+    p.add_argument("--dry-run", action="store_true", help="Do not push policy or modify device tags; print intended actions.")
 
     # Auth/config
     p.add_argument("--tailnet", default=cfg_get("TAILSCALE_TAILNET", DEFAULT_TAILNET), help="Tailnet name. Default is '-'.")
@@ -1772,8 +1881,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("KIND", "..."),
         help=(
             "Add: base <tags...> | service <name=ports> [name=ports ...] | "
-            "grant <host=client:svc,svc> [more...] | tag <device=tags_csv> [more...] "
-            "(device tagging applies only with --fix; otherwise it dry-runs)"
+            "grant <host=client:svc,svc> [more...] | tag <device=tags_csv> [more...]. "
+            "Device tag ops apply immediately; owner tag removals/replacements require --fix --allow-owner-change. "
+            "Use --dry-run to preview."
         ),
     )
     p.add_argument(
@@ -1783,8 +1893,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("KIND", "..."),
         help=(
             "Remove: base <tags...> | service <name> [name ...] | "
-            "grant <host=client:svc,svc> [more...] | tag <device=tags_csv> [more...] "
-            "(device tagging applies only with --fix; otherwise it dry-runs)"
+            "grant <host=client:svc,svc> [more...] | tag <device=tags_csv> [more...]. "
+            "Device tag ops apply immediately; owner tag removals/replacements require --fix --allow-owner-change. "
+            "Use --dry-run to preview."
         ),
     )
 
@@ -1806,11 +1917,370 @@ def require_owner_email(owner: str) -> None:
         )
 
 
+# -----------------------------
+# Interactive shell (REPL)
+# -----------------------------
+class TailShell(cmd.Cmd):
+    intro = "Tailscale helper shell. Type 'help' for commands."
+    prompt = "tailscale> "
+
+    def __init__(self, *, tailnet: str, api_key: str, owner: str, dry_run: bool):
+        super().__init__()
+        self.tailnet = tailnet
+        self.api_key = api_key
+        self.owner = owner
+        self.dry_run = dry_run
+
+        self.fix_enabled = False
+        self.allow_owner_change = False
+        self.push_allowed = False
+
+        self.policy_before: Optional[Dict[str, Any]] = None
+        self.policy_after: Optional[Dict[str, Any]] = None
+
+    # ----- utilities -----
+    def _need_policy(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        if self.policy_before is None or self.policy_after is None:
+            die("No policy loaded. Use: pull  OR  load <file>")
+        return self.policy_before, self.policy_after
+
+    def _need_api(self) -> None:
+        require_api_args(self.tailnet, self.api_key)
+
+    def _need_owner(self) -> None:
+        require_owner_email(self.owner)
+
+    def _parse(self, line: str) -> List[str]:
+        try:
+            return shlex.split(line)
+        except ValueError as e:
+            die(f"Parse error: {e}")
+
+    # ----- core commands -----
+    def do_config(self, line: str) -> None:
+        """Show current shell config."""
+        print(f"tailnet={self.tailnet!r}")
+        print(f"api_key={'<set>' if self.api_key else '<missing>'}")
+        print(f"owner={self.owner!r}")
+        print(f"dry_run={self.dry_run}")
+        print(f"fix_enabled={self.fix_enabled}")
+        print(f"allow_owner_change={self.allow_owner_change}")
+        print(f"push_allowed={self.push_allowed}")
+
+    def do_set(self, line: str) -> None:
+        """Set a config value. Usage: set <key> <value>"""
+        parts = self._parse(line)
+        if len(parts) < 2:
+            die("Usage: set <key> <value>")
+        key = parts[0].lower()
+        val = " ".join(parts[1:])
+
+        if key in ("tailnet",):
+            self.tailnet = val
+        elif key in ("api_key", "apikey", "api-key"):
+            self.api_key = val
+        elif key in ("owner", "owner_email", "owner-email"):
+            self.owner = val
+        elif key == "dry_run":
+            self.dry_run = val.lower() in ("1", "true", "yes", "on")
+        elif key == "fix":
+            self.fix_enabled = val.lower() in ("1", "true", "yes", "on")
+        elif key == "allow_owner_change":
+            self.allow_owner_change = val.lower() in ("1", "true", "yes", "on")
+        elif key == "push":
+            self.push_allowed = val.lower() in ("1", "true", "yes", "on")
+        else:
+            die(f"Unknown key {key!r}")
+        print("ok")
+
+    def do_pull(self, line: str) -> None:
+        """Pull policy from API. Usage: pull"""
+        self._need_api()
+        self.policy_before = api_pull_policy(self.tailnet, self.api_key)
+        ensure_policy_shape(self.policy_before)
+        self.policy_after = copy.deepcopy(self.policy_before)
+        print("pulled policy")
+
+    def do_load(self, line: str) -> None:
+        """Load policy from file. Usage: load <path>"""
+        parts = self._parse(line)
+        if len(parts) != 1:
+            die("Usage: load <path>")
+        self.policy_before = read_policy_file(parts[0])
+        ensure_policy_shape(self.policy_before)
+        self.policy_after = copy.deepcopy(self.policy_before)
+        print("loaded policy")
+
+    def do_reset(self, line: str) -> None:
+        """Reset policy_after back to policy_before. Usage: reset"""
+        b, a = self._need_policy()
+        self.policy_after = copy.deepcopy(b)
+        print("reset ok")
+
+    def do_status(self, line: str) -> None:
+        """Show a quick summary of the current policy_after. Usage: status"""
+        _, a = self._need_policy()
+        ensure_policy_shape(a)
+        print(f"tagOwners={len(a.get('tagOwners', {}))} grants={len(a.get('grants', []))} acls={len(a.get('acls', []))}")
+
+    def do_writepair(self, line: str) -> None:
+        """Write policy pair. Usage: writepair [outdir_or_basefile]"""
+        b, a = self._need_policy()
+        out = line.strip() or DEFAULT_LOG_DIR
+        out_dir, base = resolve_out_target(out)
+        stamp = utc_stamp()
+        in_path, out_path = write_pair(out_dir=out_dir, basename=base, stamp=stamp, before=b, after=a)
+        print(f"Wrote:\n  {in_path}\n  {out_path}")
+
+    def do_save(self, line: str) -> None:
+        """Save policy_after to a single file. Usage: save <path>"""
+        _, a = self._need_policy()
+        parts = self._parse(line)
+        if len(parts) != 1:
+            die("Usage: save <path>")
+        write_policy_file(parts[0], a)
+        print("saved")
+
+    def do_validate(self, line: str) -> None:
+        """Run local validation checks. Usage: validate"""
+        _, a = self._need_policy()
+        issues = collect_policy_issues(a)
+        if issues:
+            print("Validation issues:")
+            for iss in issues:
+                flag = "fixable" if iss.fixable else "not-fixable"
+                print(f"  - [{iss.kind}/{flag}] {iss.msg}")
+        else:
+            print("Validation: OK")
+
+    def do_validate_remote(self, line: str) -> None:
+        """Call API /acl/validate for current policy_after. Usage: validate_remote"""
+        self._need_api()
+        _, a = self._need_policy()
+        if self.dry_run:
+            print("dry-run: would call remote validate")
+            return
+        api_validate_policy(self.tailnet, self.api_key, a)
+        print("remote validate: OK")
+
+    def do_push(self, line: str) -> None:
+        """Push policy_after to tailnet (requires validation clean). Usage: push"""
+        self._need_api()
+        _, a = self._need_policy()
+        issues = collect_policy_issues(a)
+        if issues:
+            die("Refusing to push: validation issues remain.")
+        if self.dry_run:
+            print("dry-run: would push policy")
+            return
+        api_validate_policy(self.tailnet, self.api_key, a)
+        api_push_policy(self.tailnet, self.api_key, a)
+        print("pushed")
+
+    # ----- mutations -----
+    def do_add(self, line: str) -> None:
+        """
+        Add operations.
+        Usage:
+          add base <tags...>
+          add service <name=ports> [name=ports ...]
+          add tag <device=tags_csv> [more...]
+          add grant <host=client:svc,svc> [more...]   (policy only; host tagging is not done in shell)
+        """
+        parts = self._parse(line)
+        if not parts:
+            die("Usage: add <kind> ...")
+        kind = parts[0].lower()
+        _, a = self._need_policy()
+
+        if kind == "base":
+            self._need_owner()
+            add_base(a, self.owner, parts[1:])
+            print("ok")
+            return
+
+        if kind == "service":
+            self._need_owner()
+            for svc_name, ports_spec in parse_service_specs(parts[1:]):
+                add_service(a, self.owner, svc_name, ports_spec)
+            print("ok")
+            return
+
+        if kind == "grant":
+            self._need_owner()
+            for host, client_tag, svcs in parse_grant_specs(parts[1:]):
+                for s in svcs:
+                    _ = ensure_grant_tag_and_rule(a, self.owner, client_tag, s)
+            print("ok (policy updated; host tagging not performed in shell)")
+            return
+
+        if kind == "tag":
+            self._need_api()
+            self._need_owner()
+
+            # stage and apply immediately
+            pend_map: Dict[str, PendingDeviceTagChange] = {}
+            for dev_ident, tags_csv in parse_device_tag_specs(parts[1:]):
+                planned = plan_device_tag_change(dev_ident, tags_csv, remove=False)
+                if dev_ident not in pend_map:
+                    pend_map[dev_ident] = PendingDeviceTagChange(device_ident=dev_ident, add_tags=[], remove_tags=[])
+                merge_pending_device_change(pend_map[dev_ident], planned)
+
+                # ensure tagOwners for tags we might ADD
+                for t in planned.add_tags:
+                    set_tag_owner(a, t, self.owner)
+                if planned.requested_owner:
+                    set_tag_owner(a, planned.requested_owner, self.owner)
+
+            # remote tagOwners gating (push only if push_allowed)
+            tags_to_apply: set[str] = set()
+            for ch in pend_map.values():
+                tags_to_apply.update(ch.add_tags)
+                if ch.requested_owner:
+                    tags_to_apply.add(ch.requested_owner)
+
+            blocked: set[str] = set()
+            if tags_to_apply:
+                missing_remote = compute_missing_remote_tagowners(self.tailnet, self.api_key, tags_to_apply)
+                if missing_remote:
+                    if not self.push_allowed:
+                        blocked = set(missing_remote)
+                        print(f"note: missing remote tagOwners for {missing_remote} (skipping those adds; set push=on to auto-push)")
+                    else:
+                        # push policy only if validation clean
+                        issues = collect_policy_issues(a)
+                        if issues:
+                            die("Refusing to push policy for tagging: validation issues remain.")
+                        if self.dry_run:
+                            print(f"dry-run: would push policy to add remote tagOwners for {missing_remote}")
+                        else:
+                            api_validate_policy(self.tailnet, self.api_key, a)
+                            api_push_policy(self.tailnet, self.api_key, a)
+                            print(f"pushed policy (to allow tagging for {missing_remote})")
+
+            notes = apply_pending_device_tag_changes(
+                list(pend_map.values()),
+                self.tailnet,
+                self.api_key,
+                fix_enabled=self.fix_enabled,
+                allow_owner_change=self.allow_owner_change,
+                dry_run=self.dry_run,
+                blocked_add_tags=blocked,
+            )
+            for n in notes:
+                print(n)
+            return
+
+        die(f"Unknown add kind: {kind!r}")
+
+    def do_rm(self, line: str) -> None:
+        """
+        Remove operations.
+        Usage:
+          rm base <tags...>
+          rm service <name...>
+          rm tag <device=tags_csv> [more...]
+          rm grant <host=client:svc,svc> [more...]   (policy only; does not remove host tags in shell)
+        """
+        parts = self._parse(line)
+        if not parts:
+            die("Usage: rm <kind> ...")
+        kind = parts[0].lower()
+        _, a = self._need_policy()
+
+        if kind == "base":
+            rm_base(a, parts[1:])
+            print("ok")
+            return
+
+        if kind == "service":
+            for name in parts[1:]:
+                rm_service(a, name)
+            print("ok")
+            return
+
+        if kind == "grant":
+            # conservative: only policy side is updated in this shell implementation
+            for host, client_tag, svcs in parse_grant_specs(parts[1:]):
+                for s in svcs:
+                    _ = service_ports_or_die(a, s)
+                    client_val = tag_value(client_tag)
+                    _ = grant_tag_for(s, client_val)
+            print("ok (policy unchanged; host tag removals are not performed in shell)")
+            return
+
+        if kind == "tag":
+            self._need_api()
+            self._need_owner()
+
+            pend_map: Dict[str, PendingDeviceTagChange] = {}
+            for dev_ident, tags_csv in parse_device_tag_specs(parts[1:]):
+                planned = plan_device_tag_change(dev_ident, tags_csv, remove=True)
+                if dev_ident not in pend_map:
+                    pend_map[dev_ident] = PendingDeviceTagChange(device_ident=dev_ident, add_tags=[], remove_tags=[])
+                merge_pending_device_change(pend_map[dev_ident], planned)
+
+            notes = apply_pending_device_tag_changes(
+                list(pend_map.values()),
+                self.tailnet,
+                self.api_key,
+                fix_enabled=self.fix_enabled,
+                allow_owner_change=self.allow_owner_change,
+                dry_run=self.dry_run,
+                blocked_add_tags=set(),
+            )
+            for n in notes:
+                print(n)
+            return
+
+        die(f"Unknown rm kind: {kind!r}")
+
+    def do_quit(self, line: str) -> bool:
+        """Quit the shell."""
+        return True
+
+    def do_exit(self, line: str) -> bool:
+        """Exit the shell."""
+        return True
+
+    def emptyline(self) -> None:
+        # Do nothing on empty line
+        return
+
+
+def run_shell(args: argparse.Namespace) -> None:
+    sh = TailShell(tailnet=args.tailnet, api_key=args.api_key, owner=args.owner, dry_run=args.dry_run)
+
+    # If input was provided, preload
+    if args.pull:
+        require_api_args(args.tailnet, args.api_key)
+        sh.policy_before = api_pull_policy(args.tailnet, args.api_key)
+        ensure_policy_shape(sh.policy_before)
+        sh.policy_after = copy.deepcopy(sh.policy_before)
+        print("pulled policy (shell)")
+    elif args.infile:
+        sh.policy_before = read_policy_file(args.infile)
+        ensure_policy_shape(sh.policy_before)
+        sh.policy_after = copy.deepcopy(sh.policy_before)
+        print("loaded policy (shell)")
+    else:
+        print("No policy preloaded. Use: pull  OR  load <file>")
+
+    sh.cmdloop()
+
+
+# -----------------------------
+# Main pipeline
+# -----------------------------
 def main() -> None:
     args = build_parser().parse_args()
 
+    if args.shell:
+        run_shell(args)
+        return
+
     if not args.infile and not args.pull:
-        die("You must provide --in FILE or --pull for input.")
+        die("You must provide --in FILE or --pull for input (or use --shell).")
 
     add_ops = args.add or []
     rm_ops = args.rm or []
@@ -1839,6 +2309,10 @@ def main() -> None:
 
     # Pending host device tag changes from --add/--rm grant (applied only during --fix)
     pending_host_changes: Dict[str, PendingHostTagChange] = {}
+
+    # Explicit device tag ops from --add/--rm tag (applied immediately; owner changes gated)
+    pending_device_changes: Dict[str, PendingDeviceTagChange] = {}
+
     # Grant tags created in this run (protect from GC until we've had a chance to apply them)
     grant_gc_protect: set[str] = set()
 
@@ -1847,7 +2321,12 @@ def main() -> None:
             pending_host_changes[host_ident] = PendingHostTagChange(host_ident=host_ident, add_tags=[], remove_tags=[])
         return pending_host_changes[host_ident]
 
-    # Apply ops (policy mutations; device tag ops apply only with --fix)
+    def get_or_make_pending_device(dev_ident: str) -> PendingDeviceTagChange:
+        if dev_ident not in pending_device_changes:
+            pending_device_changes[dev_ident] = PendingDeviceTagChange(device_ident=dev_ident, add_tags=[], remove_tags=[])
+        return pending_device_changes[dev_ident]
+
+    # Apply ops (policy mutations; explicit tag ops staged now, applied later)
     for op in add_ops:
         kind = op[0].lower()
         if kind == "base":
@@ -1875,17 +2354,15 @@ def main() -> None:
             if len(op) < 2:
                 die("--add tag requires: --add tag <device=tags_csv> [more...]")
             for dev_ident, tags_csv in parse_device_tag_specs(op[1:]):
-                add_or_rm_device_tags(
-                    policy_after,
-                    args.owner,
-                    tailnet=args.tailnet,
-                    api_key=args.api_key,
-                    device_ident=dev_ident,
-                    tags_csv=tags_csv,
-                    remove=False,
-                    allow_owner_change=args.allow_owner_change,
-                    fix_enabled=args.fix,
-                )
+                planned = plan_device_tag_change(dev_ident, tags_csv, remove=False)
+                pend = get_or_make_pending_device(dev_ident)
+                merge_pending_device_change(pend, planned)
+
+                # Only ensure tagOwners for tags we might ADD (including requested owner)
+                for t in planned.add_tags:
+                    set_tag_owner(policy_after, t, args.owner)
+                if planned.requested_owner:
+                    set_tag_owner(policy_after, planned.requested_owner, args.owner)
         else:
             die(f"Unknown --add kind: {kind!r}")
 
@@ -1914,17 +2391,9 @@ def main() -> None:
             if len(op) < 2:
                 die("--rm tag requires: --rm tag <device=tags_csv> [more...]")
             for dev_ident, tags_csv in parse_device_tag_specs(op[1:]):
-                add_or_rm_device_tags(
-                    policy_after,
-                    args.owner,
-                    tailnet=args.tailnet,
-                    api_key=args.api_key,
-                    device_ident=dev_ident,
-                    tags_csv=tags_csv,
-                    remove=True,
-                    allow_owner_change=args.allow_owner_change,
-                    fix_enabled=args.fix,
-                )
+                planned = plan_device_tag_change(dev_ident, tags_csv, remove=True)
+                pend = get_or_make_pending_device(dev_ident)
+                merge_pending_device_change(pend, planned)
         else:
             die(f"Unknown --rm kind: {kind!r}")
 
@@ -1947,12 +2416,59 @@ def main() -> None:
     policy_issues = collect_policy_issues(policy_after)
     policy_issues.extend(gen_issues)
 
+    # Apply explicit device tag ops (immediately), including remote-tagOwners gating
+    device_tag_notes: List[str] = []
+    pushed_policy_for_explicit_tagging = False
+    if pending_device_changes:
+        tags_to_apply: set[str] = set()
+        for ch in pending_device_changes.values():
+            tags_to_apply.update(ch.add_tags)
+            if ch.requested_owner:
+                tags_to_apply.add(ch.requested_owner)
+
+        blocked_add_tags: set[str] = set()
+        if tags_to_apply:
+            missing_remote = compute_missing_remote_tagowners(args.tailnet, args.api_key, tags_to_apply)
+            if missing_remote:
+                if not args.push:
+                    blocked_add_tags = set(missing_remote)
+                    device_tag_notes.append(
+                        f"note: missing remote tagOwners for {missing_remote}; "
+                        f"skipping those tag additions (re-run with --push to auto-push policy first)"
+                    )
+                else:
+                    if policy_issues:
+                        die(
+                            "Refusing to push policy for device tagging because policy validation issues remain. "
+                            "Fix policy issues first (or run with --fix), then re-run with --push."
+                        )
+                    if args.dry_run:
+                        device_tag_notes.append(f"dry-run: would push policy to add remote tagOwners for {missing_remote}")
+                    else:
+                        api_validate_policy(args.tailnet, args.api_key, policy_after)
+                        api_push_policy(args.tailnet, args.api_key, policy_after)
+                        pushed_policy_for_explicit_tagging = True
+                        device_tag_notes.append(f"note: pushed policy early to permit device tagging for tags: {missing_remote}")
+
+        device_tag_notes.extend(
+            apply_pending_device_tag_changes(
+                list(pending_device_changes.values()),
+                args.tailnet,
+                args.api_key,
+                fix_enabled=args.fix,
+                allow_owner_change=args.allow_owner_change,
+                dry_run=args.dry_run,
+                blocked_add_tags=blocked_add_tags,
+            )
+        )
+
+    # Devname device-tag checks (read-only unless --fix)
     dev_issues: List[Issue] = []
     if args.autotag_devnames:
         dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, args.api_key)
 
     fix_notes: List[str] = []
-    pushed_policy_early = False
+    pushed_policy_early = pushed_policy_for_explicit_tagging
     grant_gc_notes: List[str] = []
 
     # Fix (mutations) if requested
@@ -1996,17 +2512,13 @@ def main() -> None:
                         tags_to_apply.add(normalize_tag_selector(i.data["tag"]))
 
             if tags_to_apply:
-                remote_policy = api_pull_policy(args.tailnet, args.api_key)
-                remote_tagowners = set((remote_policy.get("tagOwners") or {}).keys())
-                missing_remote = sorted(t for t in tags_to_apply if t not in remote_tagowners)
-
+                missing_remote = compute_missing_remote_tagowners(args.tailnet, args.api_key, tags_to_apply)
                 if missing_remote:
                     if not args.push:
                         fix_notes.append(
                             f"fix-note: need policy pushed before device tagging (missing remote tagOwners for {missing_remote}); "
                             f"skipping device tagging because --push was not set"
                         )
-                        # If we can't push, don't attempt device mutations
                         dev_issues = []
                         pending_host_changes = {}
                     else:
@@ -2015,18 +2527,23 @@ def main() -> None:
                                 "Refusing to push policy early for device tagging because policy validation issues remain. "
                                 "Fix policy issues first, then re-run with --fix --push."
                             )
-                        api_validate_policy(args.tailnet, args.api_key, policy_after)
-                        api_push_policy(args.tailnet, args.api_key, policy_after)
-                        pushed_policy_early = True
-                        fix_notes.append(f"fix-note: pushed policy early to permit device tagging for tags: {missing_remote}")
+                        if args.dry_run:
+                            fix_notes.append(f"dry-run: would push policy early to permit device tagging for tags: {missing_remote}")
+                        else:
+                            api_validate_policy(args.tailnet, args.api_key, policy_after)
+                            api_push_policy(args.tailnet, args.api_key, policy_after)
+                            pushed_policy_early = True
+                            fix_notes.append(f"fix-note: pushed policy early to permit device tagging for tags: {missing_remote}")
 
         # Apply grant host tag changes (if still present)
         if pending_host_changes:
-            fix_notes.extend(apply_pending_host_tag_changes(list(pending_host_changes.values()), args.tailnet, args.api_key))
+            fix_notes.extend(
+                apply_pending_host_tag_changes(list(pending_host_changes.values()), args.tailnet, args.api_key, dry_run=args.dry_run)
+            )
 
         # Apply devname tagging fixes (if enabled)
         if args.autotag_devnames and dev_issues:
-            fix_notes.extend(apply_devname_tag_fixes(dev_issues, args.tailnet, args.api_key))
+            fix_notes.extend(apply_devname_tag_fixes(dev_issues, args.tailnet, args.api_key, dry_run=args.dry_run))
 
         # 4) Re-run checks after fixing
         gen_issues = collect_missing_devname_tagowners(policy_after, desired_devname_tags) if args.gen_devname_tags else []
@@ -2048,7 +2565,10 @@ def main() -> None:
 
     # Optional: API-side validate without pushing
     if args.validate_remote:
-        api_validate_policy(args.tailnet, args.api_key, policy_after)
+        if args.dry_run:
+            print("dry-run: would call remote validate")
+        else:
+            api_validate_policy(args.tailnet, args.api_key, policy_after)
 
     # Output pair (default to ~/.config/.../logs, timestamped)
     stamp = utc_stamp()
@@ -2077,6 +2597,11 @@ def main() -> None:
         missing_on_device = len([i for i in dev_issues if i.kind == "devname-tag-missing-on-device"])
         print(f"autotag-devnames: checked {devname_tags_present} devname tags; missing-on-device={missing_on_device}")
 
+    if device_tag_notes:
+        print("\nDevice tag notes:")
+        for n in device_tag_notes:
+            print(f"  - {n}")
+
     if all_issues:
         print("\nValidation issues:")
         for iss in all_issues:
@@ -2096,12 +2621,14 @@ def main() -> None:
     if args.push:
         if all_issues:
             die("Refusing to --push: validation issues remain. Re-run with --fix (and/or fix manually).", code=3)
-        if not pushed_policy_early:
+        if args.dry_run:
+            print("dry-run: would push policy")
+        elif not pushed_policy_early:
             api_validate_policy(args.tailnet, args.api_key, policy_after)
             api_push_policy(args.tailnet, args.api_key, policy_after)
             print("Pushed policy successfully.")
         else:
-            print("Policy already pushed earlier during --fix to permit device tagging; no further policy push needed.")
+            print("Policy already pushed earlier to permit device tagging; no further policy push needed.")
 
     # Exit code: nonzero if issues remain
     if all_issues:
