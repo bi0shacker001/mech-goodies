@@ -132,6 +132,11 @@ BASE_PREFIXES = ("owner-", "devrole-", "ownerdept-", "devdept-", "devname-")
 SERVICE_TAG_HEAD = "service-"  # tag value starts with "service-"
 GRANT_TAG_HEAD = "grant-"      # tag value starts with "grant-"
 
+TAILDROP_CAP_SEND = "https://tailscale.com/cap/file-send"
+TAILDROP_CAP_TARGET = "https://tailscale.com/cap/file-sharing-target"
+TAILDROP_CAPS = (TAILDROP_CAP_SEND, TAILDROP_CAP_TARGET)
+
+
 
 # -----------------------------
 # Models
@@ -1252,6 +1257,36 @@ def parse_grant_specs(tokens: Sequence[str]) -> List[Tuple[str, str, List[str]]]
     return out
 
 
+
+def parse_taildrop_specs(tokens: Sequence[str]) -> List[Tuple[str, str]]:
+    """
+    Taildrop selector pairs.
+    Each token: <senderTag>:<receiverTag>
+      laptop:server
+      any:server           (wildcard sender)
+      server:any           (wildcard receiver)
+
+    Notes:
+    - For taildrop, tags are implied: do NOT use the 'tag:' prefix.
+    - Tags must already exist in tagOwners (except the special wildcard 'any').
+    """
+    out: List[Tuple[str, str]] = []
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.lower().startswith("taildrop="):
+            tok = tok.split("=", 1)[1].strip()
+        if tok.count(":") != 1:
+            die(f"taildrop expects sender:receiver tokens, got: {tok!r}")
+        s, r = [p.strip() for p in tok.split(":", 1)]
+        if not s or not r:
+            die(f"taildrop expects sender:receiver tokens, got: {tok!r}")
+        out.append((s, r))
+    return out
+
+
+
 def service_ports_or_die(policy: Dict[str, Any], service: str) -> List[str]:
     st = service_tag_for(service)
     if st not in policy.get("tagOwners", {}):
@@ -1287,6 +1322,80 @@ def ensure_grant_tag_and_rule(policy: Dict[str, Any], owner_email: str, client_t
         upsert_grant(policy, src=client_tag, dst=gt, ip=ip)
 
     return gt
+
+
+
+def _normalize_taildrop_endpoint(policy: Dict[str, Any], token: str) -> str:
+    t = token.strip()
+    if not t:
+        die("taildrop: empty endpoint")
+    tl = t.lower()
+    if tl in ("any", "*"):
+        return "*"
+    if tl.startswith("tag:"):
+        die("taildrop: tags are implied; do not use the 'tag:' prefix.")
+    sel = normalize_tag_selector(t)
+    if sel not in policy.get("tagOwners", {}):
+        die(f"taildrop: unknown tag {sel!r}. Define it first in tagOwners.")
+    return sel
+
+
+def upsert_taildrop_grant(policy: Dict[str, Any], sender: str, receiver: str, *, mutual: bool = False) -> None:
+    """
+    Ensure a taildrop grant exists from sender -> receiver.
+    Taildrop permissions are represented as app capabilities on a grant.
+    """
+    ensure_policy_shape(policy)
+    src = _normalize_taildrop_endpoint(policy, sender)
+    dst = _normalize_taildrop_endpoint(policy, receiver)
+
+    def _apply_one(a: str, b: str) -> None:
+        grants: List[Dict[str, Any]] = policy["grants"]
+        for g in grants:
+            if g.get("src") == [a] and g.get("dst") == [b]:
+                app = g.setdefault("app", {})
+                if not isinstance(app, dict):
+                    die("taildrop: grant 'app' field is not a map (unexpected policy shape)")
+                for cap in TAILDROP_CAPS:
+                    cur = app.get(cap)
+                    if cur is None:
+                        app[cap] = [{}]
+                    elif isinstance(cur, list) and not cur:
+                        app[cap] = [{}]
+                return
+        grants.append({"src": [a], "dst": [b], "app": {cap: [{}] for cap in TAILDROP_CAPS}})
+
+    _apply_one(src, dst)
+    if mutual and src != dst:
+        _apply_one(dst, src)
+
+
+def remove_taildrop_grant(policy: Dict[str, Any], sender: str, receiver: str, *, mutual: bool = False) -> None:
+    """Remove taildrop app capabilities from grant(s) matching sender -> receiver."""
+    ensure_policy_shape(policy)
+    src = _normalize_taildrop_endpoint(policy, sender)
+    dst = _normalize_taildrop_endpoint(policy, receiver)
+
+    def _apply_one(a: str, b: str) -> None:
+        grants: List[Dict[str, Any]] = policy["grants"]
+        i = 0
+        while i < len(grants):
+            g = grants[i]
+            if g.get("src") == [a] and g.get("dst") == [b]:
+                app = g.get("app")
+                if isinstance(app, dict):
+                    for cap in TAILDROP_CAPS:
+                        app.pop(cap, None)
+                    if not app:
+                        g.pop("app", None)
+                if not g.get("ip") and not g.get("app"):
+                    grants.pop(i)
+                    continue
+            i += 1
+
+    _apply_one(src, dst)
+    if mutual and src != dst:
+        _apply_one(dst, src)
 
 
 def apply_pending_host_tag_changes(
@@ -1903,6 +2012,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(autotag_devnames=False)
 
     # Operations: repeatable
+    p.add_argument("--mutual", action="store_true", help="For taildrop ops, also apply the reverse direction.")
     p.add_argument(
         "--add",
         action="append",
@@ -1910,7 +2020,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("KIND", "..."),
         help=(
             "Add: base <tags...> | service <name=ports> [name=ports ...] | "
-            "grant <host=client:svc,svc> [more...] | tag <device=tags_csv> [more...]. "
+            "grant <host=client:svc,svc> [more...] | taildrop <sender:receiver> [more...] | tag <device=tags_csv> [more...]. "
             "Device tag ops apply immediately; owner tag removals/replacements require --fix --allow-owner-change. "
             "Use --dry-run to preview."
         ),
@@ -1922,7 +2032,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("KIND", "..."),
         help=(
             "Remove: base <tags...> | service <name> [name ...] | "
-            "grant <host=client:svc,svc> [more...] | tag <device=tags_csv> [more...]. "
+            "grant <host=client:svc,svc> [more...] | taildrop <sender:receiver> [more...] | tag <device=tags_csv> [more...]. "
             "Device tag ops apply immediately; owner tag removals/replacements require --fix --allow-owner-change. "
             "Use --dry-run to preview."
         ),
@@ -2125,11 +2235,22 @@ class TailShell(cmd.Cmd):
           add service <name=ports> [name=ports ...]
           add tag <device=tags_csv> [more...]
           add grant <host=client:svc,svc> [more...]   (policy only; host tagging is not done in shell)
+          add taildrop <sender:receiver> [more...] [--mutual]
         """
         parts = self._parse(line)
         if not parts:
             die("Usage: add <kind> ...")
         kind = parts[0].lower()
+        mutual = False
+        if "--mutual" in parts:
+            mutual = True
+            parts = [p for p in parts if p != "--mutual"]
+            if not parts:
+                die("Usage: add <kind> ...")
+            kind = parts[0].lower()
+        if kind.startswith("taildrop="):
+            parts = ["taildrop", kind.split("=", 1)[1]] + parts[1:]
+            kind = "taildrop"
         _, a = self._need_policy()
 
         if kind == "base":
@@ -2151,6 +2272,12 @@ class TailShell(cmd.Cmd):
                 for s in svcs:
                     _ = ensure_grant_tag_and_rule(a, self.owner, client_tag, s)
             print("ok (policy updated; host tagging not performed in shell)")
+            return
+
+        if kind == "taildrop":
+            for sender, receiver in parse_taildrop_specs(parts[1:]):
+                upsert_taildrop_grant(a, sender, receiver, mutual=mutual)
+            print("ok")
             return
 
         if kind == "tag":
@@ -2220,11 +2347,22 @@ class TailShell(cmd.Cmd):
           rm service <name...>
           rm tag <device=tags_csv> [more...]
           rm grant <host=client:svc,svc> [more...]   (policy only; does not remove host tags in shell)
+          rm taildrop <sender:receiver> [more...] [--mutual]
         """
         parts = self._parse(line)
         if not parts:
             die("Usage: rm <kind> ...")
         kind = parts[0].lower()
+        mutual = False
+        if "--mutual" in parts:
+            mutual = True
+            parts = [p for p in parts if p != "--mutual"]
+            if not parts:
+                die("Usage: rm <kind> ...")
+            kind = parts[0].lower()
+        if kind.startswith("taildrop="):
+            parts = ["taildrop", kind.split("=", 1)[1]] + parts[1:]
+            kind = "taildrop"
         _, a = self._need_policy()
 
         if kind == "base":
@@ -2368,6 +2506,9 @@ def main() -> None:
     # Apply ops (policy mutations; explicit tag ops staged now, applied later)
     for op in add_ops:
         kind = op[0].lower()
+        if kind.startswith("taildrop="):
+            op = ["taildrop", kind.split("=", 1)[1]] + op[1:]
+            kind = "taildrop"
         if kind == "base":
             require_owner_email(args.owner)
             add_base(policy_after, args.owner, op[1:])
@@ -2388,6 +2529,9 @@ def main() -> None:
                     pend = get_or_make_pending(host)
                     pend.add_tags.append(gt)
                     grant_gc_protect.add(gt)
+        elif kind == "taildrop":
+            for sender, receiver in parse_taildrop_specs(op[1:]):
+                upsert_taildrop_grant(policy_after, sender, receiver, mutual=args.mutual)
         elif kind == "tag":
             require_owner_email(args.owner)
             if len(op) < 2:
@@ -2407,6 +2551,9 @@ def main() -> None:
 
     for op in rm_ops:
         kind = op[0].lower()
+        if kind.startswith("taildrop="):
+            op = ["taildrop", kind.split("=", 1)[1]] + op[1:]
+            kind = "taildrop"
         if kind == "base":
             rm_base(policy_after, op[1:])
         elif kind == "service":
@@ -2425,6 +2572,9 @@ def main() -> None:
                     gt = grant_tag_for(s, client_val)
                     pend = get_or_make_pending(host)
                     pend.remove_tags.append(gt)
+        elif kind == "taildrop":
+            for sender, receiver in parse_taildrop_specs(op[1:]):
+                remove_taildrop_grant(policy_after, sender, receiver, mutual=args.mutual)
         elif kind == "tag":
             require_owner_email(args.owner)
             if len(op) < 2:
