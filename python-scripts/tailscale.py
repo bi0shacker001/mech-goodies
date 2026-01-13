@@ -105,6 +105,7 @@ import re
 import shlex
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -2096,8 +2097,73 @@ def resolve_out_target(out_arg: str) -> Tuple[str, str]:
 # -----------------------------
 # CLI
 # -----------------------------
+
+# -----------------------------
+# Shared help / docs
+# -----------------------------
+CLI_OPS_HELP = r"""Operations (CLI)
+
+Input:
+  --pull
+  --in FILE
+
+Write/push:
+  --out OUT            (dir or base filename; writes pre/post pair)
+  --stamp              (timestamp output filenames)
+  --push               (push policy if validation is clean)
+  --dry-run            (no pushes; no device tag mutations)
+
+Ops (repeatable):
+  --add base TAG [TAG...]
+  --rm  base TAG [TAG...]
+
+  --add service NAME=PORTS [NAME=PORTS...]
+  --rm  service NAME [NAME...]
+    PORTS examples:
+      8989/tcp
+      8096,8920
+      80-443
+      any          (alias for '*')
+      any/tcp
+
+  --add grant HOST=CLIENT:SVC[,SVC...] [more...]
+  --rm  grant HOST=CLIENT:SVC[,SVC...] [more...]
+    CLIENT:
+      a base tag value like owner-alice, devrole-server, devdept-lab, etc
+      or 'any' for wildcard ('*')
+    SVC:
+      a service name like sonarr/radarr that must exist as tag:service-<svc>
+      or 'any' meaning any port (ip ['*'])
+    Special case:
+      CLIENT=any and SVC!=any adds/removes tag:service-<svc> on the host
+
+  --add tag DEVICE=TAG[,TAG...] [more...]
+  --rm  tag DEVICE=TAG[,TAG...] [more...]
+    Device tag ops are applied during --fix in the shell; in CLI they are applied during --fix as well.
+    Owner-tag safety rule still applies:
+      removing/replacing an existing owner-* requires --fix --allow-owner-change
+      adding the first owner-* is allowed without --fix
+
+  --add taildrop SENDER:RECEIVER [more...] [--mutual]
+  --rm  taildrop SENDER:RECEIVER [more...] [--mutual]
+    Taildrop endpoints are tag VALUES (no 'tag:' prefix) or 'any'.
+    Tags must already exist in tagOwners (except 'any').
+
+Taildrop mutual:
+  --mutual   For taildrop ops only, also apply the reverse direction.
+
+Examples:
+  tailscale-api --pull --allow-all yes --push
+  tailscale-api --pull --add service sonarr=8989/tcp radarr=7878 --fix --out ./logs
+  tailscale-api --pull --add grant media-host=owner-alice:sonarr,radarr --fix --push
+  tailscale-api --pull --add grant media-host=any:sonarr --fix --push
+  tailscale-api --pull --add taildrop devrole-client:devrole-server --mutual --fix --push
+"""
+
+SHELL_HELP_HINT = "Type 'help ops' for the CLI-style operations syntax, or 'help flags' for full CLI flags."
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(add_help=True)
+    p = argparse.ArgumentParser(add_help=True, formatter_class=argparse.RawTextHelpFormatter, epilog=CLI_OPS_HELP)
 
     # Interactive
     p.add_argument("--shell", action="store_true", help="Start an interactive shell (REPL).")
@@ -2235,7 +2301,7 @@ def require_owner_email(owner: str) -> None:
 # Interactive shell (REPL)
 # -----------------------------
 class TailShell(cmd.Cmd):
-    intro = "Tailscale helper shell. Type 'help' for commands."
+    intro = "Tailscale helper shell. Type 'help' for commands. " + SHELL_HELP_HINT
     prompt = "tailscale> "
 
     def __init__(self, *, auth: AuthContext, owner: str, dry_run: bool):
@@ -2245,16 +2311,55 @@ class TailShell(cmd.Cmd):
         self.owner = owner
         self.dry_run = dry_run
 
-        self.fix_enabled = False
-        self.allow_owner_change = False
-        self.push_allowed = False
-        self.allow_all: Optional[str] = None
-        self.grant_gc: Optional[bool] = None
+        # shell toggles / global state
+        self.fix_enabled: bool = False
+        self.allow_owner_change: bool = False
+        self.push_allowed: bool = False
 
+        self.allow_all: Optional[str] = None      # "yes" | "no" | None
+        self.grant_gc: Optional[bool] = None      # True | False | None
+
+        self.out: str = DEFAULT_LOG_DIR
+        self.stamp: bool = True
+
+        # policy state
         self.policy_before: Optional[Dict[str, Any]] = None
         self.policy_after: Optional[Dict[str, Any]] = None
 
+        # queued changes (applied during 'fix' if fix_enabled)
+        self.pending_host_changes: Dict[str, PendingHostTagChange] = {}
+        self.pending_device_changes: Dict[str, PendingDeviceTagChange] = {}
+        self.grant_gc_protect: set[str] = set()
+
+    # ----- cmd.Cmd plumbing -----
+    def parseline(self, line: str):
+        cmdname, arg, line2 = super().parseline(line)
+        if cmdname:
+            cmdname = cmdname.replace("-", "_")
+        return cmdname, arg, line2
+
+    def onecmd(self, line: str) -> bool:
+        try:
+            return bool(super().onecmd(line))
+        except SystemExit:
+            # die() already printed the error. Keep the shell alive.
+            return False
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def default(self, line: str) -> None:
+        die(f"Unknown command: {line!r} (try: help)")
+
+    def emptyline(self) -> None:
+        return
+
     # ----- utilities -----
+    def _reset_pending(self) -> None:
+        self.pending_host_changes.clear()
+        self.pending_device_changes.clear()
+        self.grant_gc_protect.clear()
+
     def _need_policy(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if self.policy_before is None or self.policy_after is None:
             die("No policy loaded. Use: pull  OR  load <file>")
@@ -2273,128 +2378,279 @@ class TailShell(cmd.Cmd):
         except ValueError as e:
             die(f"Parse error: {e}")
 
-    # ----- core commands -----
-    def do_config(self, line: str) -> None:
-        """Show current shell config."""
+    def _dirty(self) -> bool:
+        if self.policy_before is None or self.policy_after is None:
+            return False
+        try:
+            return json.dumps(self.policy_before, sort_keys=True) != json.dumps(self.policy_after, sort_keys=True)
+        except Exception:
+            return True
+
+    def _get_or_make_pending_host(self, host_ident: str) -> PendingHostTagChange:
+        if host_ident not in self.pending_host_changes:
+            self.pending_host_changes[host_ident] = PendingHostTagChange(host_ident=host_ident, add_tags=[], remove_tags=[])
+        return self.pending_host_changes[host_ident]
+
+    def _get_or_make_pending_device(self, dev_ident: str) -> PendingDeviceTagChange:
+        if dev_ident not in self.pending_device_changes:
+            self.pending_device_changes[dev_ident] = PendingDeviceTagChange(device_ident=dev_ident, add_tags=[], remove_tags=[])
+        return self.pending_device_changes[dev_ident]
+
+    def _render_pending(self) -> None:
+        print(f"pending host changes: {len(self.pending_host_changes) if self.pending_host_changes else 'none'}")
+        print(f"pending device changes: {len(self.pending_device_changes) if self.pending_device_changes else 'none'}")
+
+
+def _list_shell_commands(self) -> List[str]:
+    names = []
+    for n in self.get_names():
+        if not n.startswith("do_"):
+            continue
+        cmdname = n[3:]
+        if cmdname.startswith("_"):
+            continue
+        if cmdname in ("EOF",):
+            continue
+        # hide aliases from the top list (still accessible)
+        if cmdname in ("status", "config"):
+            continue
+        names.append(cmdname.replace("_", "-"))
+    # stable ordering: common commands first, then the rest
+    preferred = [
+        "help", "show", "load", "pull", "write", "validate", "validate-remote",
+        "fix", "push", "add", "rm", "set", "exit", "quit",
+    ]
+    out = []
+    for p in preferred:
+        if p in names and p not in out:
+            out.append(p)
+    for n in sorted(names):
+        if n not in out:
+            out.append(n)
+    return out
+
+def _command_summary(self, cmdname: str) -> str:
+    # cmdname may include '-' but do_ uses '_'
+    meth = getattr(self, "do_" + cmdname.replace("-", "_"), None)
+    doc = getattr(meth, "__doc__", "") if meth else ""
+    if not doc:
+        return ""
+    return doc.strip().splitlines()[0]
+
+    # ----- help -----
+
+def do_help(self, arg: str) -> None:
+    """help [command]
+
+    Show shell help. Try:
+      help
+      help ops
+      help flags
+      help add
+      help set
+    """
+    raw = (arg or "").strip()
+    key = raw.replace("-", "_")
+
+    if key in ("", "commands"):
+        print("Shell commands:")
+        for name in self._list_shell_commands():
+            summary = self._command_summary(name)
+            print(f"  {name:<14} {summary}")
+        print()
+        print(SHELL_HELP_HINT)
+        return
+
+    if key in ("ops", "operations"):
+        print(CLI_OPS_HELP)
+        return
+
+    if key in ("flags", "cli"):
+        print(build_parser().format_help())
+        return
+
+    # Fall back to cmd.Cmd's docstring-based help.
+    return cmd.Cmd.do_help(self, key)
+    def do_show(self, line: str) -> None:
+        """show
+Show shell state summary."""
+        loaded = self.policy_after is not None
         print(f"tailnet={self.tailnet!r}")
         if self.auth.api_key:
-            print("api_key=<set>")
+            print("auth=api-key")
         elif self.auth.oauth_client_id and self.auth.oauth_client_secret:
-            print("api_key=<oauth>")
+            print("auth=oauth")
         else:
-            print("api_key=<missing>")
-        print(f"oauth_client_id={'<set>' if self.auth.oauth_client_id else '<missing>'}")
-        print(f"oauth_tags={self.auth.oauth_tags!r}")
+            print("auth=<missing>")
         print(f"owner={self.owner!r}")
         print(f"dry_run={self.dry_run}")
-        print(f"fix_enabled={self.fix_enabled}")
-        print(f"allow_owner_change={self.allow_owner_change}")
-        print(f"push_allowed={self.push_allowed}")
-        print(f"allow_all={self.allow_all!r}")
-        print(f"grant_gc={self.grant_gc!r}")
+        print(f"policy_loaded={loaded} dirty={self._dirty()}")
+        print(f"fix={self.fix_enabled} allow-owner-change={self.allow_owner_change} push={self.push_allowed}")
+        print(f"allow-all={self.allow_all!r} grant-gc={self.grant_gc!r}")
+        print(f"out={self.out!r} stamp={self.stamp}")
+        self._render_pending()
+
+    # aliases
+    def do_status(self, line: str) -> None:
+        self.do_show(line)
+
+    def do_config(self, line: str) -> None:
+        self.do_show(line)
 
     def do_set(self, line: str) -> None:
-        """Set a config value. Usage: set <key> <value>"""
+        """set KEY VALUE
+Set shell toggles. See: help set"""
         parts = self._parse(line)
         if len(parts) < 2:
             die("Usage: set <key> <value>")
-        key = parts[0].lower()
-        val = " ".join(parts[1:])
+        key = parts[0].lower().replace("-", "_")
+        val = " ".join(parts[1:]).strip()
 
-        # Helper function to parse boolean values
-        def parse_bool_value(v: str) -> bool:
-            return v.lower() in ("1", "true", "yes", "on")
+        def is_unset(v: str) -> bool:
+            return v.lower() in ("unset", "none", "null", "")
 
-        # Helper function to handle unset values
-        def handle_unset(v: str):
-            return v.lower() in ("unset", "none", "null")
+        def parse_on_off(v: str) -> bool:
+            v = v.lower()
+            if v in ("1", "true", "yes", "on"):
+                return True
+            if v in ("0", "false", "no", "off"):
+                return False
+            die(f"Expected on/off (or yes/no), got {v!r}")
 
-        if key in ("tailnet",):
-            self.tailnet = val
-            self.auth.tailnet = self.tailnet
-        elif key in ("api_key", "apikey", "api-key"):
-            if handle_unset(val) or not val:
-                self.auth.api_key = ""
+        if key == "allow_all":
+            v = val.lower()
+            if v in ("yes", "no"):
+                self.allow_all = v
+                if self.policy_after is not None:
+                    notes = apply_allow_all_setting(self.policy_after, v)
+                    if notes:
+                        print(f"allow-all: {', '.join(notes)}")
+                else:
+                    print("ok (will apply when policy is loaded)")
+            elif is_unset(v):
+                self.allow_all = None
+                print("ok")
             else:
-                self.auth.api_key = val
-        elif key in ("oauth_client_id", "oauth-client-id"):
-            self.auth.oauth_client_id = "" if handle_unset(val) else val
-            self.auth._access_token = ""
-            self.auth._expires_at = 0.0
-        elif key in ("oauth_client_secret", "oauth-client-secret"):
-            self.auth.oauth_client_secret = "" if handle_unset(val) else val
-            self.auth._access_token = ""
-            self.auth._expires_at = 0.0
-        elif key in ("oauth_scope", "oauth-scope"):
-            self.auth.oauth_scope = "" if handle_unset(val) else val
-            self.auth._access_token = ""
-            self.auth._expires_at = 0.0
-        elif key in ("oauth_tags", "oauth-tags"):
-            self.auth.oauth_tags = "" if handle_unset(val) else val
-            self.auth._access_token = ""
-            self.auth._expires_at = 0.0
-        elif key in ("owner", "owner_email", "owner-email"):
+                die("set allow-all yes|no|unset")
+            return
+
+        if key == "grant_gc":
+            v = val.lower()
+            if v in ("on", "true", "yes", "1"):
+                self.grant_gc = True
+            elif v in ("off", "false", "no", "0"):
+                self.grant_gc = False
+            elif is_unset(v):
+                self.grant_gc = None
+            else:
+                die("set grant-gc on|off|unset")
+            print("ok")
+            return
+
+        if key in ("fix", "allow_owner_change", "push", "stamp", "dry_run"):
+            attr = {
+                "fix": "fix_enabled",
+                "allow_owner_change": "allow_owner_change",
+                "push": "push_allowed",
+                "stamp": "stamp",
+                "dry_run": "dry_run",
+            }[key]
+            setattr(self, attr, parse_on_off(val))
+            print("ok")
+            return
+
+        if key == "out":
+            self.out = val
+            print("ok")
+            return
+
+        if key == "tailnet":
+            self.tailnet = val
+            self.auth.tailnet = val
+            print("ok")
+            return
+
+        if key in ("owner", "owner_email"):
             self.owner = val
-        elif key in ("dry_run", "fix", "allow_owner_change", "push"):
-            setattr(self, {"dry_run": "dry_run", "fix": "fix_enabled", "allow_owner_change": "allow_owner_change", "push": "push_allowed"}[key], parse_bool_value(val))
-        elif key == "allow_all":
-            self.allow_all = None if handle_unset(val) else parse_bool_value(val)
-        elif key == "grant_gc":
-            self.grant_gc = None if handle_unset(val) else parse_bool_value(val)
-        else:
-            die(f"Unknown key {key!r}")
-        print("ok")
+            print("ok")
+            return
+
+        if key in ("api_key", "api-key", "apikey"):
+            self.auth.api_key = "" if is_unset(val) else val
+            self.auth._access_token = ""
+            self.auth._expires_at = 0.0
+            print("ok")
+            return
+
+        if key in ("oauth_client_id", "oauth-client-id"):
+            self.auth.oauth_client_id = "" if is_unset(val) else val
+            self.auth._access_token = ""
+            self.auth._expires_at = 0.0
+            print("ok")
+            return
+
+        if key in ("oauth_client_secret", "oauth-client-secret"):
+            self.auth.oauth_client_secret = "" if is_unset(val) else val
+            self.auth._access_token = ""
+            self.auth._expires_at = 0.0
+            print("ok")
+            return
+
+        if key in ("oauth_scope", "oauth-scope"):
+            self.auth.oauth_scope = "" if is_unset(val) else val
+            self.auth._access_token = ""
+            self.auth._expires_at = 0.0
+            print("ok")
+            return
+
+        if key in ("oauth_tags", "oauth-tags"):
+            self.auth.oauth_tags = "" if is_unset(val) else val
+            self.auth._access_token = ""
+            self.auth._expires_at = 0.0
+            print("ok")
+            return
+
+        die(f"Unknown key {key!r}")
 
     def do_pull(self, line: str) -> None:
-        """Pull policy from API. Usage: pull"""
+        """pull
+Pull policy from the API and reset pending changes."""
         self._need_api()
         self.policy_before = api_pull_policy(self.tailnet, self.auth.token())
         ensure_policy_shape(self.policy_before)
         self.policy_after = copy.deepcopy(self.policy_before)
+        self._reset_pending()
+        if self.allow_all in ("yes", "no"):
+            apply_allow_all_setting(self.policy_after, self.allow_all)
         print("pulled policy")
 
     def do_load(self, line: str) -> None:
-        """Load policy from file. Usage: load <path>"""
+        """load FILE
+Load a local policy file (json/json5)."""
         parts = self._parse(line)
         if len(parts) != 1:
             die("Usage: load <path>")
         self.policy_before = read_policy_file(parts[0])
         ensure_policy_shape(self.policy_before)
         self.policy_after = copy.deepcopy(self.policy_before)
+        self._reset_pending()
+        if self.allow_all in ("yes", "no"):
+            apply_allow_all_setting(self.policy_after, self.allow_all)
         print("loaded policy")
 
-    def do_reset(self, line: str) -> None:
-        """Reset policy_after back to policy_before. Usage: reset"""
+    def do_write(self, line: str) -> None:
+        """write [OUT]
+Write a pre/post pair to disk (OUT can be dir or base filename)."""
         b, a = self._need_policy()
-        self.policy_after = copy.deepcopy(b)
-        print("reset ok")
-
-    def do_status(self, line: str) -> None:
-        """Show a quick summary of the current policy_after. Usage: status"""
-        _, a = self._need_policy()
-        ensure_policy_shape(a)
-        print(f"tagOwners={len(a.get('tagOwners', {}))} grants={len(a.get('grants', []))} acls={len(a.get('acls', []))}")
-
-    def do_writepair(self, line: str) -> None:
-        """Write policy pair. Usage: writepair [outdir_or_basefile]"""
-        b, a = self._need_policy()
-        out = line.strip() or DEFAULT_LOG_DIR
+        out = line.strip() or self.out
         out_dir, base = resolve_out_target(out)
-        stamp = utc_stamp()
+        stamp = utc_stamp() if self.stamp else None
         in_path, out_path = write_pair(out_dir=out_dir, basename=base, stamp=stamp, before=b, after=a)
         print(f"Wrote:\n  {in_path}\n  {out_path}")
 
-    def do_save(self, line: str) -> None:
-        """Save policy_after to a single file. Usage: save <path>"""
-        _, a = self._need_policy()
-        parts = self._parse(line)
-        if len(parts) != 1:
-            die("Usage: save <path>")
-        write_policy_file(parts[0], a)
-        print("saved")
-
     def do_validate(self, line: str) -> None:
-        """Run local validation checks. Usage: validate"""
+        """validate
+Run local validation checks against the in-memory policy."""
         _, a = self._need_policy()
         issues = collect_policy_issues(a)
         if issues:
@@ -2406,7 +2662,8 @@ class TailShell(cmd.Cmd):
             print("Validation: OK")
 
     def do_validate_remote(self, line: str) -> None:
-        """Call API /acl/validate for current policy_after. Usage: validate_remote"""
+        """validate-remote
+Call API /acl/validate with current in-memory policy."""
         self._need_api()
         _, a = self._need_policy()
         if self.dry_run:
@@ -2416,7 +2673,8 @@ class TailShell(cmd.Cmd):
         print("remote validate: OK")
 
     def do_push(self, line: str) -> None:
-        """Push policy_after to tailnet (requires validation clean). Usage: push"""
+        """push
+Validate then push the in-memory policy."""
         self._need_api()
         _, a = self._need_policy()
         issues = collect_policy_issues(a)
@@ -2429,28 +2687,105 @@ class TailShell(cmd.Cmd):
         api_push_policy(self.tailnet, self.auth.token(), a)
         print("pushed")
 
+    def do_fix(self, line: str) -> None:
+        """fix
+Apply fixable policy issues and apply queued tag changes (when fix=on)."""
+        self._need_api()
+        self._need_owner()
+        _, a = self._need_policy()
+
+        issues = collect_policy_issues(a)
+        if issues:
+            for n in apply_policy_fixes(a, self.owner, issues):
+                print(n)
+
+        if self.grant_gc is True:
+            gc_issues = collect_unused_grant_tag_issues(a, self.tailnet, self.auth.token())
+            gc_issues = [
+                i for i in gc_issues
+                if i.data and normalize_tag_selector(i.data.get("tag", "")) not in self.grant_gc_protect
+            ]
+            if gc_issues:
+                if self.fix_enabled:
+                    for n in apply_grant_gc_fixes(a, gc_issues):
+                        print(n)
+                else:
+                    print("grant-gc findings (set fix=on to apply removals):")
+                    for iss in gc_issues:
+                        print(f"  - {iss.msg}")
+
+        if not (self.pending_host_changes or self.pending_device_changes):
+            print("fix: no pending tag changes")
+            return
+
+        if not self.fix_enabled:
+            if self.pending_host_changes:
+                print(f"fix (fix=off): would apply {len(self.pending_host_changes)} host tag change(s)")
+            if self.pending_device_changes:
+                print(f"fix (fix=off): would apply {len(self.pending_device_changes)} device tag change(s)")
+            return
+
+        tags_to_apply: set[str] = set()
+        for ch in self.pending_device_changes.values():
+            tags_to_apply.update(ch.add_tags)
+            if ch.requested_owner:
+                tags_to_apply.add(ch.requested_owner)
+
+        blocked: set[str] = set()
+        if tags_to_apply:
+            missing_remote = compute_missing_remote_tagowners(self.tailnet, self.auth.token(), tags_to_apply)
+            if missing_remote:
+                if not self.push_allowed:
+                    blocked = set(missing_remote)
+                    print(f"note: missing remote tagOwners for {missing_remote} (skipping those adds; set push=on to auto-push)")
+                else:
+                    post_issues = collect_policy_issues(a)
+                    if post_issues:
+                        die("Refusing to push policy for tagging: validation issues remain.")
+                    if self.dry_run:
+                        print(f"dry-run: would push policy to add remote tagOwners for {missing_remote}")
+                    else:
+                        api_validate_policy(self.tailnet, self.auth.token(), a)
+                        api_push_policy(self.tailnet, self.auth.token(), a)
+                        print(f"pushed policy (to allow tagging for {missing_remote})")
+
+        if self.pending_host_changes:
+            for n in apply_pending_host_tag_changes(
+                list(self.pending_host_changes.values()), self.tailnet, self.auth.token(), dry_run=self.dry_run
+            ):
+                print(n)
+
+        if self.pending_device_changes:
+            for n in apply_pending_device_tag_changes(
+                list(self.pending_device_changes.values()),
+                self.tailnet,
+                self.auth.token(),
+                fix_enabled=self.fix_enabled,
+                allow_owner_change=self.allow_owner_change,
+                dry_run=self.dry_run,
+                blocked_add_tags=blocked,
+            ):
+                print(n)
+
+        self._reset_pending()
+        print("fix: done")
+
     # ----- mutations -----
-    def do_add(self, line: str) -> None:
-        """
-        Add operations.
-        Usage:
-          add base <tags...>
-          add service <name=ports> [name=ports ...]
-          add tag <device=tags_csv> [more...]
-          add grant <host=client:svc,svc> [more...]   (policy only; host tagging is not done in shell)
-          add taildrop <sender:receiver> [more...] [--mutual]
-        """
-        parts = self._parse(line)
-        if not parts:
-            die("Usage: add <kind> ...")
-        kind = parts[0].lower()
+    def _parse_mutual(self, parts: List[str]) -> Tuple[List[str], bool]:
         mutual = False
         if "--mutual" in parts:
             mutual = True
             parts = [p for p in parts if p != "--mutual"]
-            if not parts:
-                die("Usage: add <kind> ...")
-            kind = parts[0].lower()
+        return parts, mutual
+
+    def do_add(self, line: str) -> None:
+        """add KIND ...
+Apply an add operation. See: help ops"""
+        parts = self._parse(line)
+        if not parts:
+            die("Usage: add <kind> ...")
+        parts, mutual = self._parse_mutual(parts)
+        kind = parts[0].lower()
         if kind.startswith("taildrop="):
             parts = ["taildrop", kind.split("=", 1)[1]] + parts[1:]
             kind = "taildrop"
@@ -2472,12 +2807,16 @@ class TailShell(cmd.Cmd):
         if kind == "grant":
             self._need_owner()
             for host, client_sel, svcs in parse_grant_specs(parts[1:]):
+                pend = self._get_or_make_pending_host(host)
                 for s in svcs:
                     if client_sel == "*" and s != "any":
                         _ = service_ports_or_die(a, s)
+                        pend.add_tags.append(service_tag_for(s))
                         continue
-                    _ = ensure_grant_tag_and_rule(a, self.owner, client_sel, s)
-            print("ok (policy updated; host tagging not performed in shell)")
+                    gt = ensure_grant_tag_and_rule(a, self.owner, client_sel, s)
+                    pend.add_tags.append(gt)
+                    self.grant_gc_protect.add(gt)
+            print("ok (queued host tagging; run: set fix on ; fix)")
             return
 
         if kind == "taildrop":
@@ -2487,85 +2826,28 @@ class TailShell(cmd.Cmd):
             return
 
         if kind == "tag":
-            self._need_api()
             self._need_owner()
-
-            # stage and apply immediately
-            pend_map: Dict[str, PendingDeviceTagChange] = {}
             for dev_ident, tags_csv in parse_device_tag_specs(parts[1:]):
                 planned = plan_device_tag_change(dev_ident, tags_csv, remove=False)
-                if dev_ident not in pend_map:
-                    pend_map[dev_ident] = PendingDeviceTagChange(device_ident=dev_ident, add_tags=[], remove_tags=[])
-                merge_pending_device_change(pend_map[dev_ident], planned)
-
-                # ensure tagOwners for tags we might ADD
+                pend = self._get_or_make_pending_device(dev_ident)
+                merge_pending_device_change(pend, planned)
                 for t in planned.add_tags:
                     set_tag_owner(a, t, self.owner)
                 if planned.requested_owner:
                     set_tag_owner(a, planned.requested_owner, self.owner)
-
-            # remote tagOwners gating (push only if push_allowed)
-            tags_to_apply: set[str] = set()
-            for ch in pend_map.values():
-                tags_to_apply.update(ch.add_tags)
-                if ch.requested_owner:
-                    tags_to_apply.add(ch.requested_owner)
-
-            blocked: set[str] = set()
-            if tags_to_apply:
-                missing_remote = compute_missing_remote_tagowners(self.tailnet, self.auth.token(), tags_to_apply)
-                if missing_remote:
-                    if not self.push_allowed:
-                        blocked = set(missing_remote)
-                        print(f"note: missing remote tagOwners for {missing_remote} (skipping those adds; set push=on to auto-push)")
-                    else:
-                        # push policy only if validation clean
-                        issues = collect_policy_issues(a)
-                        if issues:
-                            die("Refusing to push policy for tagging: validation issues remain.")
-                        if self.dry_run:
-                            print(f"dry-run: would push policy to add remote tagOwners for {missing_remote}")
-                        else:
-                            api_validate_policy(self.tailnet, self.auth.token(), a)
-                            api_push_policy(self.tailnet, self.auth.token(), a)
-                            print(f"pushed policy (to allow tagging for {missing_remote})")
-
-            notes = apply_pending_device_tag_changes(
-                list(pend_map.values()),
-                self.tailnet,
-                self.auth.token(),
-                fix_enabled=self.fix_enabled,
-                allow_owner_change=self.allow_owner_change,
-                dry_run=self.dry_run,
-                blocked_add_tags=blocked,
-            )
-            for n in notes:
-                print(n)
+            print("ok (queued device tagging; run: set fix on ; fix)")
             return
 
         die(f"Unknown add kind: {kind!r}")
 
     def do_rm(self, line: str) -> None:
-        """
-        Remove operations.
-        Usage:
-          rm base <tags...>
-          rm service <name...>
-          rm tag <device=tags_csv> [more...]
-          rm grant <host=client:svc,svc> [more...]   (policy only; does not remove host tags in shell)
-          rm taildrop <sender:receiver> [more...] [--mutual]
-        """
+        """rm KIND ...
+Apply a remove operation. See: help ops"""
         parts = self._parse(line)
         if not parts:
             die("Usage: rm <kind> ...")
+        parts, mutual = self._parse_mutual(parts)
         kind = parts[0].lower()
-        mutual = False
-        if "--mutual" in parts:
-            mutual = True
-            parts = [p for p in parts if p != "--mutual"]
-            if not parts:
-                die("Usage: rm <kind> ...")
-            kind = parts[0].lower()
         if kind.startswith("taildrop="):
             parts = ["taildrop", kind.split("=", 1)[1]] + parts[1:]
             kind = "taildrop"
@@ -2583,51 +2865,45 @@ class TailShell(cmd.Cmd):
             return
 
         if kind == "grant":
-            # conservative: only policy side is updated in this shell implementation
             for host, client_sel, svcs in parse_grant_specs(parts[1:]):
+                pend = self._get_or_make_pending_host(host)
                 for s in svcs:
+                    if client_sel == "*" and s != "any":
+                        _ = service_ports_or_die(a, s)
+                        pend.remove_tags.append(service_tag_for(s))
+                        continue
                     if s != "any":
                         _ = service_ports_or_die(a, s)
-            print("ok (policy unchanged; host tag removals are not performed in shell)")
+                    client_val = "any" if client_sel == "*" else tag_value(client_sel)
+                    pend.remove_tags.append(grant_tag_for(s, client_val))
+            print("ok (queued host tag removals; run: set fix on ; fix)")
+            return
+
+        if kind == "taildrop":
+            for sender, receiver in parse_taildrop_specs(parts[1:]):
+                remove_taildrop_grant(a, sender, receiver, mutual=mutual)
+            print("ok")
             return
 
         if kind == "tag":
-            self._need_api()
-            self._need_owner()
-
-            pend_map: Dict[str, PendingDeviceTagChange] = {}
             for dev_ident, tags_csv in parse_device_tag_specs(parts[1:]):
                 planned = plan_device_tag_change(dev_ident, tags_csv, remove=True)
-                if dev_ident not in pend_map:
-                    pend_map[dev_ident] = PendingDeviceTagChange(device_ident=dev_ident, add_tags=[], remove_tags=[])
-                merge_pending_device_change(pend_map[dev_ident], planned)
-
-            notes = apply_pending_device_tag_changes(
-                list(pend_map.values()),
-                self.tailnet,
-                self.auth.token(),
-                fix_enabled=self.fix_enabled,
-                allow_owner_change=self.allow_owner_change,
-                dry_run=self.dry_run,
-                blocked_add_tags=set(),
-            )
-            for n in notes:
-                print(n)
+                pend = self._get_or_make_pending_device(dev_ident)
+                merge_pending_device_change(pend, planned)
+            print("ok (queued device tag removals; run: set fix on ; fix)")
             return
 
         die(f"Unknown rm kind: {kind!r}")
 
     def do_quit(self, line: str) -> bool:
-        """Quit the shell."""
+        """quit
+Quit the shell."""
         return True
 
     def do_exit(self, line: str) -> bool:
-        """Exit the shell."""
+        """exit
+Exit the shell."""
         return True
-
-    def emptyline(self) -> None:
-        # Do nothing on empty line
-        return
 
 
 def run_shell(args: argparse.Namespace) -> None:
