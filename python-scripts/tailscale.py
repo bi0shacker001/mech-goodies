@@ -518,12 +518,28 @@ def list_base_tags(policy: Dict[str, Any]) -> List[str]:
     return sorted(set(tags))
 
 
+
 def parse_service_tag(tag_selector: str) -> Optional[str]:
     """
     tag:service-<service>
     Returns: service name
+
+    NOTE: this is used in validators that walk grants/tagOwners. It must tolerate
+    non-tag selectors like "*", autogroup:/group:, and emails.
     """
-    ts = normalize_tag_selector(tag_selector)
+    s = tag_selector.strip()
+    if not s or s in ("*", "any"):
+        return None
+    if s.startswith(("autogroup:", "group:")):
+        return None
+    if "@" in s and not s.startswith("tag:"):
+        return None
+
+    try:
+        ts = normalize_tag_selector(s)
+    except SystemExit:
+        return None
+
     v = tag_value(ts)  # e.g. "service-sonarr"
     if not v.startswith(SERVICE_TAG_HEAD):
         return None
@@ -539,8 +555,23 @@ def parse_grant_tag(tag_selector: str) -> Optional[Tuple[str, str]]:
     clientTagValue is expected to start with one of BASE_PREFIXES.
 
     Returns: (service, clientTagValue)
+
+    NOTE: this is used in validators that walk grants/tagOwners. It must tolerate
+    non-tag selectors like "*", autogroup:/group:, and emails.
     """
-    ts = normalize_tag_selector(tag_selector)
+    s = tag_selector.strip()
+    if not s or s in ("*", "any"):
+        return None
+    if s.startswith(("autogroup:", "group:")):
+        return None
+    if "@" in s and not s.startswith("tag:"):
+        return None
+
+    try:
+        ts = normalize_tag_selector(s)
+    except SystemExit:
+        return None
+
     v = tag_value(ts)  # e.g. "grant-sonarr-owner-alice"
     if not v.startswith(GRANT_TAG_HEAD):
         return None
@@ -555,7 +586,6 @@ def parse_grant_tag(tag_selector: str) -> Optional[Tuple[str, str]]:
             if re.fullmatch(r"[a-z][a-z0-9-]*", service) and re.fullmatch(r"[a-z][a-z0-9-]*", client_val):
                 return (service, client_val)
     return None
-
 
 def list_services(policy: Dict[str, Any]) -> List[str]:
     ensure_policy_shape(policy)
