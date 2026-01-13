@@ -104,6 +104,7 @@ import os
 import re
 import shlex
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -118,6 +119,12 @@ DEFAULT_TAILNET = "-"         # "-" means "this token's tailnet"
 DEFAULT_API_KEY = ""          # tskey-api-... (still sensitive)
 DEFAULT_OWNER_EMAIL = ""      # intentionally blank: must be provided via env file/env var/flag
 
+# OAuth client credentials (Trust credentials)
+DEFAULT_OAUTH_CLIENT_ID = ""
+DEFAULT_OAUTH_CLIENT_SECRET = ""
+DEFAULT_OAUTH_SCOPE = ""      # optional space-delimited scopes
+DEFAULT_OAUTH_TAGS = ""       # optional comma/space-delimited tags
+
 # Read extra variables from here (if present)
 MECH_ENV_PATH = os.path.expanduser("~/.config/mech-goodies/tailscale.env")
 
@@ -127,6 +134,7 @@ WRITE_TIMESTAMPED_PAIR_BY_DEFAULT = True
 DEFAULT_OUT_BASENAME = "tailnet-policy"
 
 API_BASE = "https://api.tailscale.com"
+OAUTH_TOKEN_URL = API_BASE + "/api/v2/oauth/token"
 
 BASE_PREFIXES = ("owner-", "devrole-", "ownerdept-", "devdept-", "devname-")
 SERVICE_TAG_HEAD = "service-"  # tag value starts with "service-"
@@ -213,6 +221,15 @@ def cfg_get(key: str, default: str) -> str:
     (CLI flags are handled by argparse, so they win above this.)
     """
     return os.environ.get(key) or MECH_ENV.get(key) or default
+
+
+def cfg_get_any(keys: Sequence[str], default: str) -> str:
+    """Return the first non-empty value across multiple env keys (OS env > mech env file)."""
+    for k in keys:
+        v = os.environ.get(k) or MECH_ENV.get(k)
+        if v:
+            return v
+    return default
 
 
 # -----------------------------
@@ -729,6 +746,88 @@ def apply_allow_all_setting(policy: Dict[str, Any], mode: Optional[str]) -> List
 # -----------------------------
 # API layer
 # -----------------------------
+
+
+@dataclass
+class AuthContext:
+    """Resolves an API auth token from either a static API key or OAuth client credentials."""
+
+    tailnet: str
+    api_key: str = ""
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    oauth_scope: str = ""
+    oauth_tags: str = ""  # comma/space-delimited tags; sent as space-delimited
+
+    _access_token: str = ""
+    _expires_at: float = 0.0
+
+    def has_auth(self) -> bool:
+        return bool(self.api_key) or bool(self.oauth_client_id and self.oauth_client_secret)
+
+    def token(self) -> str:
+        if self.api_key:
+            return self.api_key
+
+        if not (self.oauth_client_id and self.oauth_client_secret):
+            die("Missing API credentials. Provide --api-key or --oauth-client-id/--oauth-client-secret.")
+
+        now = time.time()
+        if self._access_token and now < self._expires_at:
+            return self._access_token
+
+        self._access_token, self._expires_at = oauth_client_credentials_token(
+            self.oauth_client_id,
+            self.oauth_client_secret,
+            scope=self.oauth_scope,
+            tags=self.oauth_tags,
+        )
+        return self._access_token
+
+
+def oauth_client_credentials_token(
+    client_id: str,
+    client_secret: str,
+    *,
+    scope: str = "",
+    tags: str = "",
+) -> Tuple[str, float]:
+    """Return (access_token, expires_at_epoch)."""
+    data: Dict[str, str] = {"client_id": client_id, "client_secret": client_secret}
+    scope = (scope or "").strip()
+    if scope:
+        data["scope"] = scope
+
+    # OAuth token endpoint uses a non-standard 'tags' parameter (space-delimited)
+    raw_tags = (tags or "").strip()
+    if raw_tags:
+        tags_s = " ".join([t for t in re.split(r"[\s,]+", raw_tags) if t])
+        data["tags"] = tags_s
+
+    try:
+        resp = requests.post(OAUTH_TOKEN_URL, data=data, timeout=30)
+    except Exception as e:
+        die(f"OAuth token request failed: {e}")
+
+    if resp.status_code != 200:
+        die(f"OAuth token request failed: HTTP {resp.status_code}\n{resp.text}")
+
+    try:
+        obj = resp.json()
+    except Exception as e:
+        die(f"OAuth token response was not JSON: {e}\n{resp.text[:300]}")
+
+    token = obj.get("access_token") if isinstance(obj, dict) else None
+    expires_in = obj.get("expires_in") if isinstance(obj, dict) else None
+    if not isinstance(token, str) or not token:
+        die(f"OAuth token response missing access_token: {obj}")
+    if not isinstance(expires_in, (int, float)):
+        expires_in = 3600
+
+    # Refresh a little early
+    expires_at = time.time() + float(expires_in) - 30.0
+    return token, expires_at
+
 def api_req(
     method: str,
     path: str,
@@ -2016,6 +2115,26 @@ def build_parser() -> argparse.ArgumentParser:
     # Auth/config
     p.add_argument("--tailnet", default=cfg_get("TAILSCALE_TAILNET", DEFAULT_TAILNET), help="Tailnet name. Default is '-'.")
     p.add_argument("--api-key", default=cfg_get("TAILSCALE_API_KEY", DEFAULT_API_KEY), help="API key.")
+    p.add_argument(
+        "--oauth-client-id",
+        default=cfg_get_any(["TS_API_CLIENT_ID", "TAILSCALE_OAUTH_CLIENT_ID", "OAUTH_CLIENT_ID"], DEFAULT_OAUTH_CLIENT_ID),
+        help="OAuth client ID (Trust credentials). Used if --api-key is not provided.",
+    )
+    p.add_argument(
+        "--oauth-client-secret",
+        default=cfg_get_any(["TS_API_CLIENT_SECRET", "TAILSCALE_OAUTH_CLIENT_SECRET", "OAUTH_CLIENT_SECRET"], DEFAULT_OAUTH_CLIENT_SECRET),
+        help="OAuth client secret (Trust credentials). Used if --api-key is not provided.",
+    )
+    p.add_argument(
+        "--oauth-scope",
+        default=cfg_get_any(["TS_API_SCOPE", "TAILSCALE_OAUTH_SCOPE"], DEFAULT_OAUTH_SCOPE),
+        help="Optional OAuth scope(s), space-delimited. Defaults to the OAuth client\npermissions.",
+    )
+    p.add_argument(
+        "--oauth-tags",
+        default=cfg_get_any(["TS_API_TAGS", "TAILSCALE_OAUTH_TAGS"], DEFAULT_OAUTH_TAGS),
+        help="Optional OAuth tags (comma or space delimited). Only relevant for some scopes.",
+    )
     p.add_argument("--owner", default=cfg_get("TAILSCALE_OWNER_EMAIL", DEFAULT_OWNER_EMAIL), help="Owner email for tagOwners.")
 
     # Policy toggles
@@ -2083,11 +2202,25 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def require_api_args(tailnet: str, api_key: str) -> None:
+def make_auth_context(args: argparse.Namespace) -> AuthContext:
+    return AuthContext(
+        tailnet=args.tailnet,
+        api_key=(args.api_key or "").strip(),
+        oauth_client_id=(args.oauth_client_id or "").strip(),
+        oauth_client_secret=(args.oauth_client_secret or "").strip(),
+        oauth_scope=(args.oauth_scope or "").strip(),
+        oauth_tags=(args.oauth_tags or "").strip(),
+    )
+
+
+def require_api_args(tailnet: str, auth: AuthContext) -> None:
     if not tailnet:
         die("Missing tailnet. Provide --tailnet, env TAILSCALE_TAILNET, or set DEFAULT_TAILNET.")
-    if not api_key:
-        die("Missing API key. Provide --api-key, env TAILSCALE_API_KEY, or set DEFAULT_API_KEY.")
+    if not auth.has_auth():
+        die(
+            "Missing API credentials. Provide --api-key (TAILSCALE_API_KEY) OR OAuth client credentials "
+            "(--oauth-client-id/--oauth-client-secret, TS_API_CLIENT_ID/TS_API_CLIENT_SECRET)."
+        )
 
 
 def require_owner_email(owner: str) -> None:
@@ -2105,10 +2238,10 @@ class TailShell(cmd.Cmd):
     intro = "Tailscale helper shell. Type 'help' for commands."
     prompt = "tailscale> "
 
-    def __init__(self, *, tailnet: str, api_key: str, owner: str, dry_run: bool):
+    def __init__(self, *, auth: AuthContext, owner: str, dry_run: bool):
         super().__init__()
-        self.tailnet = tailnet
-        self.api_key = api_key
+        self.auth = auth
+        self.tailnet = auth.tailnet
         self.owner = owner
         self.dry_run = dry_run
 
@@ -2128,7 +2261,8 @@ class TailShell(cmd.Cmd):
         return self.policy_before, self.policy_after
 
     def _need_api(self) -> None:
-        require_api_args(self.tailnet, self.api_key)
+        self.auth.tailnet = self.tailnet
+        require_api_args(self.tailnet, self.auth)
 
     def _need_owner(self) -> None:
         require_owner_email(self.owner)
@@ -2143,7 +2277,14 @@ class TailShell(cmd.Cmd):
     def do_config(self, line: str) -> None:
         """Show current shell config."""
         print(f"tailnet={self.tailnet!r}")
-        print(f"api_key={'<set>' if self.api_key else '<missing>'}")
+        if self.auth.api_key:
+            print("api_key=<set>")
+        elif self.auth.oauth_client_id and self.auth.oauth_client_secret:
+            print("api_key=<oauth>")
+        else:
+            print("api_key=<missing>")
+        print(f"oauth_client_id={'<set>' if self.auth.oauth_client_id else '<missing>'}")
+        print(f"oauth_tags={self.auth.oauth_tags!r}")
         print(f"owner={self.owner!r}")
         print(f"dry_run={self.dry_run}")
         print(f"fix_enabled={self.fix_enabled}")
@@ -2170,8 +2311,28 @@ class TailShell(cmd.Cmd):
 
         if key in ("tailnet",):
             self.tailnet = val
+            self.auth.tailnet = self.tailnet
         elif key in ("api_key", "apikey", "api-key"):
-            self.api_key = val
+            if handle_unset(val) or not val:
+                self.auth.api_key = ""
+            else:
+                self.auth.api_key = val
+        elif key in ("oauth_client_id", "oauth-client-id"):
+            self.auth.oauth_client_id = "" if handle_unset(val) else val
+            self.auth._access_token = ""
+            self.auth._expires_at = 0.0
+        elif key in ("oauth_client_secret", "oauth-client-secret"):
+            self.auth.oauth_client_secret = "" if handle_unset(val) else val
+            self.auth._access_token = ""
+            self.auth._expires_at = 0.0
+        elif key in ("oauth_scope", "oauth-scope"):
+            self.auth.oauth_scope = "" if handle_unset(val) else val
+            self.auth._access_token = ""
+            self.auth._expires_at = 0.0
+        elif key in ("oauth_tags", "oauth-tags"):
+            self.auth.oauth_tags = "" if handle_unset(val) else val
+            self.auth._access_token = ""
+            self.auth._expires_at = 0.0
         elif key in ("owner", "owner_email", "owner-email"):
             self.owner = val
         elif key in ("dry_run", "fix", "allow_owner_change", "push"):
@@ -2187,7 +2348,7 @@ class TailShell(cmd.Cmd):
     def do_pull(self, line: str) -> None:
         """Pull policy from API. Usage: pull"""
         self._need_api()
-        self.policy_before = api_pull_policy(self.tailnet, self.api_key)
+        self.policy_before = api_pull_policy(self.tailnet, self.auth.token())
         ensure_policy_shape(self.policy_before)
         self.policy_after = copy.deepcopy(self.policy_before)
         print("pulled policy")
@@ -2251,7 +2412,7 @@ class TailShell(cmd.Cmd):
         if self.dry_run:
             print("dry-run: would call remote validate")
             return
-        api_validate_policy(self.tailnet, self.api_key, a)
+        api_validate_policy(self.tailnet, self.auth.token(), a)
         print("remote validate: OK")
 
     def do_push(self, line: str) -> None:
@@ -2264,8 +2425,8 @@ class TailShell(cmd.Cmd):
         if self.dry_run:
             print("dry-run: would push policy")
             return
-        api_validate_policy(self.tailnet, self.api_key, a)
-        api_push_policy(self.tailnet, self.api_key, a)
+        api_validate_policy(self.tailnet, self.auth.token(), a)
+        api_push_policy(self.tailnet, self.auth.token(), a)
         print("pushed")
 
     # ----- mutations -----
@@ -2352,7 +2513,7 @@ class TailShell(cmd.Cmd):
 
             blocked: set[str] = set()
             if tags_to_apply:
-                missing_remote = compute_missing_remote_tagowners(self.tailnet, self.api_key, tags_to_apply)
+                missing_remote = compute_missing_remote_tagowners(self.tailnet, self.auth.token(), tags_to_apply)
                 if missing_remote:
                     if not self.push_allowed:
                         blocked = set(missing_remote)
@@ -2365,14 +2526,14 @@ class TailShell(cmd.Cmd):
                         if self.dry_run:
                             print(f"dry-run: would push policy to add remote tagOwners for {missing_remote}")
                         else:
-                            api_validate_policy(self.tailnet, self.api_key, a)
-                            api_push_policy(self.tailnet, self.api_key, a)
+                            api_validate_policy(self.tailnet, self.auth.token(), a)
+                            api_push_policy(self.tailnet, self.auth.token(), a)
                             print(f"pushed policy (to allow tagging for {missing_remote})")
 
             notes = apply_pending_device_tag_changes(
                 list(pend_map.values()),
                 self.tailnet,
-                self.api_key,
+                self.auth.token(),
                 fix_enabled=self.fix_enabled,
                 allow_owner_change=self.allow_owner_change,
                 dry_run=self.dry_run,
@@ -2444,7 +2605,7 @@ class TailShell(cmd.Cmd):
             notes = apply_pending_device_tag_changes(
                 list(pend_map.values()),
                 self.tailnet,
-                self.api_key,
+                self.auth.token(),
                 fix_enabled=self.fix_enabled,
                 allow_owner_change=self.allow_owner_change,
                 dry_run=self.dry_run,
@@ -2470,12 +2631,13 @@ class TailShell(cmd.Cmd):
 
 
 def run_shell(args: argparse.Namespace) -> None:
-    sh = TailShell(tailnet=args.tailnet, api_key=args.api_key, owner=args.owner, dry_run=args.dry_run)
+    auth = make_auth_context(args)
+    sh = TailShell(auth=auth, owner=args.owner, dry_run=args.dry_run)
 
     # If input was provided, preload
     if args.pull:
-        require_api_args(args.tailnet, args.api_key)
-        sh.policy_before = api_pull_policy(args.tailnet, args.api_key)
+        require_api_args(args.tailnet, auth)
+        sh.policy_before = api_pull_policy(args.tailnet, auth.token())
         ensure_policy_shape(sh.policy_before)
         sh.policy_after = copy.deepcopy(sh.policy_before)
         print("pulled policy (shell)")
@@ -2495,6 +2657,7 @@ def run_shell(args: argparse.Namespace) -> None:
 # -----------------------------
 def main() -> None:
     args = build_parser().parse_args()
+    auth = make_auth_context(args)
 
     if args.shell:
         run_shell(args)
@@ -2517,11 +2680,11 @@ def main() -> None:
         or ops_need_api
     )
     if needs_api:
-        require_api_args(args.tailnet, args.api_key)
+        require_api_args(args.tailnet, auth)
 
     # Load policy
     if args.pull:
-        policy_before = api_pull_policy(args.tailnet, args.api_key)
+        policy_before = api_pull_policy(args.tailnet, auth.token())
     else:
         policy_before = read_policy_file(args.infile)
 
@@ -2656,7 +2819,7 @@ def main() -> None:
     gen_issues: List[Issue] = []
 
     if args.gen_devname_tags:
-        devices_cache = api_list_devices(args.tailnet, args.api_key)
+        devices_cache = api_list_devices(args.tailnet, auth.token())
         desired_devname_tags, gen_notes = desired_devname_tags_from_devices(devices_cache)
         gen_issues = collect_missing_devname_tagowners(policy_after, desired_devname_tags)
 
@@ -2676,7 +2839,7 @@ def main() -> None:
 
         blocked_add_tags: set[str] = set()
         if tags_to_apply:
-            missing_remote = compute_missing_remote_tagowners(args.tailnet, args.api_key, tags_to_apply)
+            missing_remote = compute_missing_remote_tagowners(args.tailnet, auth.token(), tags_to_apply)
             if missing_remote:
                 if not args.push:
                     blocked_add_tags = set(missing_remote)
@@ -2693,8 +2856,8 @@ def main() -> None:
                     if args.dry_run:
                         device_tag_notes.append(f"dry-run: would push policy to add remote tagOwners for {missing_remote}")
                     else:
-                        api_validate_policy(args.tailnet, args.api_key, policy_after)
-                        api_push_policy(args.tailnet, args.api_key, policy_after)
+                        api_validate_policy(args.tailnet, auth.token(), policy_after)
+                        api_push_policy(args.tailnet, auth.token(), policy_after)
                         pushed_policy_for_explicit_tagging = True
                         device_tag_notes.append(f"note: pushed policy early to permit device tagging for tags: {missing_remote}")
 
@@ -2702,7 +2865,7 @@ def main() -> None:
             apply_pending_device_tag_changes(
                 list(pending_device_changes.values()),
                 args.tailnet,
-                args.api_key,
+                auth.token(),
                 fix_enabled=args.fix,
                 allow_owner_change=args.allow_owner_change,
                 dry_run=args.dry_run,
@@ -2713,7 +2876,7 @@ def main() -> None:
     # Devname device-tag checks (read-only unless --fix)
     dev_issues: List[Issue] = []
     if args.autotag_devnames:
-        dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, args.api_key)
+        dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, auth.token())
 
     fix_notes: List[str] = []
     pushed_policy_early = pushed_policy_for_explicit_tagging
@@ -2741,7 +2904,7 @@ def main() -> None:
 
         # 2) Device-side fixes: devname autotag
         if args.autotag_devnames:
-            dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, args.api_key)
+            dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, auth.token())
 
         # 3) Device-side changes for grants (pending host tagging)
         pending_changes_list = list(pending_host_changes.values())
@@ -2760,7 +2923,7 @@ def main() -> None:
                         tags_to_apply.add(normalize_tag_selector(i.data["tag"]))
 
             if tags_to_apply:
-                missing_remote = compute_missing_remote_tagowners(args.tailnet, args.api_key, tags_to_apply)
+                missing_remote = compute_missing_remote_tagowners(args.tailnet, auth.token(), tags_to_apply)
                 if missing_remote:
                     if not args.push:
                         fix_notes.append(
@@ -2778,29 +2941,29 @@ def main() -> None:
                         if args.dry_run:
                             fix_notes.append(f"dry-run: would push policy early to permit device tagging for tags: {missing_remote}")
                         else:
-                            api_validate_policy(args.tailnet, args.api_key, policy_after)
-                            api_push_policy(args.tailnet, args.api_key, policy_after)
+                            api_validate_policy(args.tailnet, auth.token(), policy_after)
+                            api_push_policy(args.tailnet, auth.token(), policy_after)
                             pushed_policy_early = True
                             fix_notes.append(f"fix-note: pushed policy early to permit device tagging for tags: {missing_remote}")
 
         # Apply grant host tag changes (if still present)
         if pending_host_changes:
             fix_notes.extend(
-                apply_pending_host_tag_changes(list(pending_host_changes.values()), args.tailnet, args.api_key, dry_run=args.dry_run)
+                apply_pending_host_tag_changes(list(pending_host_changes.values()), args.tailnet, auth.token(), dry_run=args.dry_run)
             )
 
         # Apply devname tagging fixes (if enabled)
         if args.autotag_devnames and dev_issues:
-            fix_notes.extend(apply_devname_tag_fixes(dev_issues, args.tailnet, args.api_key, dry_run=args.dry_run))
+            fix_notes.extend(apply_devname_tag_fixes(dev_issues, args.tailnet, auth.token(), dry_run=args.dry_run))
 
         # 4) Re-run checks after fixing
         gen_issues = collect_missing_devname_tagowners(policy_after, desired_devname_tags) if args.gen_devname_tags else []
         policy_issues = collect_policy_issues(policy_after) + gen_issues
-        dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, args.api_key) if args.autotag_devnames else []
+        dev_issues = collect_devname_tag_issues(policy_after, args.tailnet, auth.token()) if args.autotag_devnames else []
 
     # Optional: grant GC (not part of validation)
     if args.grant_gc:
-        gc_issues = collect_unused_grant_tag_issues(policy_after, args.tailnet, args.api_key)
+        gc_issues = collect_unused_grant_tag_issues(policy_after, args.tailnet, auth.token())
         # Protect tags created in this run (they may not be applied to hosts yet)
         gc_issues = [i for i in gc_issues if i.data and normalize_tag_selector(i.data.get("tag", "")) not in grant_gc_protect]
         if gc_issues:
@@ -2816,7 +2979,7 @@ def main() -> None:
         if args.dry_run:
             print("dry-run: would call remote validate")
         else:
-            api_validate_policy(args.tailnet, args.api_key, policy_after)
+            api_validate_policy(args.tailnet, auth.token(), policy_after)
 
     # Output pair (default to ~/.config/.../logs, timestamped)
     stamp = utc_stamp()
@@ -2872,8 +3035,8 @@ def main() -> None:
         if args.dry_run:
             print("dry-run: would push policy")
         elif not pushed_policy_early:
-            api_validate_policy(args.tailnet, args.api_key, policy_after)
-            api_push_policy(args.tailnet, args.api_key, policy_after)
+            api_validate_policy(args.tailnet, auth.token(), policy_after)
+            api_push_policy(args.tailnet, auth.token(), policy_after)
             print("Pushed policy successfully.")
         else:
             print("Policy already pushed earlier to permit device tagging; no further policy push needed.")
