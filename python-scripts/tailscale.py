@@ -303,7 +303,7 @@ def normalize_grant_endpoint(sel: str) -> str:
     s = sel.strip()
     if not s:
         die("Empty grant endpoint selector.")
-    if s == "*":
+    if s in ("*", "any"):
         return "*"
     if s.startswith(("autogroup:", "group:")):
         return s
@@ -365,6 +365,10 @@ def parse_ports_spec(ports_spec: str) -> List[str]:
         tok = tok.strip()
         if not tok:
             die("Empty token in ports spec.")
+
+
+        if tok.lower() == "any":
+            tok = "*"
 
         # Direct capability selector pass-through (must not combine with /tcp or /udp)
         mcap = re.fullmatch(r"([a-z0-9]+):(\*|\d{1,5}|\d{1,5}-\d{1,5})", tok.lower())
@@ -1232,9 +1236,16 @@ def parse_service_specs(tokens: Sequence[str]) -> List[Tuple[str, str]]:
 
 def parse_grant_specs(tokens: Sequence[str]) -> List[Tuple[str, str, List[str]]]:
     """
-    Each token: <host>=<clientTag>:<svc,svc,...>
+    Each token: <host>=<clientTag|any>:<svc,svc,...|any>
       media-host-1=owner-alice:sonarr,radarr
-    Returns: [(host_ident, client_tag_selector, [services...]), ...]
+      media-host-1=any:sonarr
+      media-host-1=owner-alice:any
+      media-host-1=any:any
+
+    Notes:
+      - client 'any' (or '*') means wildcard src ["*"].
+      - service 'any' (or '*') means wildcard ports ip ["*"] (not a service tag).
+    Returns: [(host_ident, client_selector_or_star, [services...]), ...]
     """
     out: List[Tuple[str, str, List[str]]] = []
     for tok in tokens:
@@ -1245,14 +1256,26 @@ def parse_grant_specs(tokens: Sequence[str]) -> List[Tuple[str, str, List[str]]]
         rhs = rhs.strip()
         if not host or not rhs or ":" not in rhs:
             die(f"Invalid grant spec {tok!r}. Expected host=clientTag:svc,svc")
-        client, svcs = rhs.split(":", 1)
-        client = normalize_tag_selector(client.strip())
-        svcs_list = [s.strip().lower() for s in svcs.split(",") if s.strip()]
-        if not svcs_list:
-            die(f"Invalid grant spec {tok!r}: no services listed.")
-        for s in svcs_list:
+        client_raw, svcs = rhs.split(":", 1)
+        client_raw = client_raw.strip()
+        if not client_raw:
+            die(f"Invalid grant spec {tok!r}: empty client selector.")
+        if client_raw.lower() in ("any", "*"):
+            client = "*"
+        else:
+            client = normalize_tag_selector(client_raw)
+
+        svcs_list: List[str] = []
+        for s in [p.strip().lower() for p in svcs.split(",") if p.strip()]:
+            if s in ("any", "*"):
+                svcs_list.append("any")
+                continue
             if not re.fullmatch(r"[a-z][a-z0-9-]*", s):
                 die(f"Invalid service name {s!r} in {tok!r}. Use letters/digits/dashes, starting with a letter.")
+            svcs_list.append(s)
+
+        if not svcs_list:
+            die(f"Invalid grant spec {tok!r}: no services listed.")
         out.append((host, client, svcs_list))
     return out
 
@@ -1302,24 +1325,35 @@ def service_ports_or_die(policy: Dict[str, Any], service: str) -> List[str]:
 def ensure_grant_tag_and_rule(policy: Dict[str, Any], owner_email: str, client_tag: str, service: str) -> str:
     """
     Ensure:
-      - tagOwners has tag:grant-<service>-<clientTagValue>
-      - grants contains client_tag -> grant_tag with ip matching service definition
+      - tagOwners has tag:grant-<service>-<clientTagValue> (including service/client == "any")
+      - grants contains src -> grant_tag with ip matching the service definition (or ["*"] for service "any")
     Returns the grant_tag selector.
+
+    Notes:
+      - client_tag may be "*" to indicate wildcard src.
+      - service may be "any" to indicate wildcard ip ["*"].
+      - client_tag="*" with service != "any" is intentionally handled by callers (it maps to service tags, not grant tags).
     """
     ensure_policy_shape(policy)
 
-    # client_tag must exist as a base tag in tagOwners (we use it as src)
-    if client_tag not in policy.get("tagOwners", {}):
-        die(f"Client tag {client_tag} is not defined in tagOwners. Add it via --add base ... first.")
+    # Resolve ip list
+    ip = ["*"] if service == "any" else service_ports_or_die(policy, service)
 
-    ip = service_ports_or_die(policy, service)
+    # Resolve src selector + client_val used in the grant tag name
+    if client_tag == "*":
+        src_sel = "*"
+        client_val = "any"
+    else:
+        if client_tag not in policy.get("tagOwners", {}):
+            die(f"Client tag {client_tag} is not defined in tagOwners. Add it via --add base ... first.")
+        src_sel = client_tag
+        client_val = tag_value(client_tag)
 
-    client_val = tag_value(client_tag)
     gt = grant_tag_for(service, client_val)
     set_tag_owner(policy, gt, owner_email)
 
-    if not grant_exists(policy, src=client_tag, dst=gt, ip=ip):
-        upsert_grant(policy, src=client_tag, dst=gt, ip=ip)
+    if not grant_exists(policy, src=src_sel, dst=gt, ip=ip):
+        upsert_grant(policy, src=src_sel, dst=gt, ip=ip)
 
     return gt
 
@@ -1514,35 +1548,43 @@ def collect_policy_issues(policy: Dict[str, Any]) -> List[Issue]:
         if not parsed:
             continue
         service, client_val = parsed
-        st = service_tag_for(service)
 
-        if st not in policy.get("tagOwners", {}):
-            issues.append(
-                Issue(
-                    kind="grant-missing-service",
-                    msg=f"Grant tag {gt} refers to service '{service}', but {st} is not defined in tagOwners.",
-                    fixable=False,
-                    data={"grant_tag": gt, "service": service},
+        # Service "any" is a wildcard ports grant (ip ["*"]) and does not require a service tag.
+        if service == "any":
+            ip = ["*"]
+        else:
+            st = service_tag_for(service)
+            if st not in policy.get("tagOwners", {}):
+                issues.append(
+                    Issue(
+                        kind="grant-missing-service",
+                        msg=f"Grant tag {gt} refers to service '{service}', but {st} is not defined in tagOwners.",
+                        fixable=False,
+                        data={"grant_tag": gt, "service": service},
+                    )
                 )
-            )
-            continue
+                continue
+            ip = service_ip.get(service)
+            if not ip:
+                # service-missing-ports already captured; don't duplicate too much
+                continue
 
-        ip = service_ip.get(service)
-        if not ip:
-            # service-missing-ports already captured; don't duplicate too much
-            continue
-
-        client_tag = normalize_tag_selector(client_val)
-        if client_tag not in policy.get("tagOwners", {}):
-            issues.append(
-                Issue(
-                    kind="grant-missing-client-tagowner",
-                    msg=f"Grant tag {gt} refers to client tag {client_tag}, but it is not defined in tagOwners.",
-                    fixable=False,
-                    data={"grant_tag": gt, "client_tag": client_tag},
+        # Client "any" means wildcard src ["*"] and does not require a client tagOwner.
+        if client_val == "any":
+            client_src = "*"
+        else:
+            client_tag = normalize_tag_selector(client_val)
+            if client_tag not in policy.get("tagOwners", {}):
+                issues.append(
+                    Issue(
+                        kind="grant-missing-client-tagowner",
+                        msg=f"Grant tag {gt} refers to client tag {client_tag}, but it is not defined in tagOwners.",
+                        fixable=False,
+                        data={"grant_tag": gt, "client_tag": client_tag},
+                    )
                 )
-            )
-            continue
+                continue
+            client_src = client_tag
 
         if gt not in policy.get("tagOwners", {}):
             issues.append(
@@ -1554,13 +1596,13 @@ def collect_policy_issues(policy: Dict[str, Any]) -> List[Issue]:
                 )
             )
 
-        if not grant_exists(policy, src=client_tag, dst=gt, ip=ip):
+        if not grant_exists(policy, src=client_src, dst=gt, ip=ip):
             issues.append(
                 Issue(
                     kind="missing-grant",
-                    msg=f"Missing or mismatched grant {client_tag} -> {gt} with ip={ip} (should match service '{service}').",
+                    msg=f"Missing or mismatched grant {client_src} -> {gt} with ip={ip} (should match service '{service}').",
                     fixable=True,
-                    data={"src": client_tag, "dst": gt, "ip": ip},
+                    data={"src": client_src, "dst": gt, "ip": ip},
                 )
             )
 
@@ -2268,9 +2310,12 @@ class TailShell(cmd.Cmd):
 
         if kind == "grant":
             self._need_owner()
-            for host, client_tag, svcs in parse_grant_specs(parts[1:]):
+            for host, client_sel, svcs in parse_grant_specs(parts[1:]):
                 for s in svcs:
-                    _ = ensure_grant_tag_and_rule(a, self.owner, client_tag, s)
+                    if client_sel == "*" and s != "any":
+                        _ = service_ports_or_die(a, s)
+                        continue
+                    _ = ensure_grant_tag_and_rule(a, self.owner, client_sel, s)
             print("ok (policy updated; host tagging not performed in shell)")
             return
 
@@ -2378,11 +2423,10 @@ class TailShell(cmd.Cmd):
 
         if kind == "grant":
             # conservative: only policy side is updated in this shell implementation
-            for host, client_tag, svcs in parse_grant_specs(parts[1:]):
+            for host, client_sel, svcs in parse_grant_specs(parts[1:]):
                 for s in svcs:
-                    _ = service_ports_or_die(a, s)
-                    client_val = tag_value(client_tag)
-                    _ = grant_tag_for(s, client_val)
+                    if s != "any":
+                        _ = service_ports_or_die(a, s)
             print("ok (policy unchanged; host tag removals are not performed in shell)")
             return
 
@@ -2519,16 +2563,24 @@ def main() -> None:
             for svc_name, ports_spec in parse_service_specs(op[1:]):
                 add_service(policy_after, args.owner, svc_name, ports_spec)
         elif kind == "grant":
-            # policy side is always updated; device tagging happens only with --fix
+            # policy side is always updated; host tagging happens only with --fix
             require_owner_email(args.owner)
             if len(op) < 2:
                 die("--add grant requires: --add grant <host=client:svc,svc> [more...]")
-            for host, client_tag, svcs in parse_grant_specs(op[1:]):
+            for host, client_sel, svcs in parse_grant_specs(op[1:]):
+                pend = get_or_make_pending(host)
                 for s in svcs:
-                    gt = ensure_grant_tag_and_rule(policy_after, args.owner, client_tag, s)
-                    pend = get_or_make_pending(host)
+                    if client_sel == "*" and s != "any":
+                        # wildcard clients for a concrete service -> tag the host with the service tag
+                        _ = service_ports_or_die(policy_after, s)
+                        st = service_tag_for(s)
+                        pend.add_tags.append(st)
+                        continue
+
+                    gt = ensure_grant_tag_and_rule(policy_after, args.owner, client_sel, s)
                     pend.add_tags.append(gt)
                     grant_gc_protect.add(gt)
+
         elif kind == "taildrop":
             for sender, receiver in parse_taildrop_specs(op[1:]):
                 upsert_taildrop_grant(policy_after, sender, receiver, mutual=args.mutual)
@@ -2564,14 +2616,21 @@ def main() -> None:
         elif kind == "grant":
             if len(op) < 2:
                 die("--rm grant requires: --rm grant <host=client:svc,svc> [more...]")
-            for host, client_tag, svcs in parse_grant_specs(op[1:]):
+            for host, client_sel, svcs in parse_grant_specs(op[1:]):
                 # remove host tag(s); policy cleanup is intentionally conservative
+                pend = get_or_make_pending(host)
                 for s in svcs:
-                    _ = service_ports_or_die(policy_after, s)
-                    client_val = tag_value(client_tag)
+                    if client_sel == "*" and s != "any":
+                        _ = service_ports_or_die(policy_after, s)
+                        pend.remove_tags.append(service_tag_for(s))
+                        continue
+
+                    if s != "any":
+                        _ = service_ports_or_die(policy_after, s)
+                    client_val = "any" if client_sel == "*" else tag_value(client_sel)
                     gt = grant_tag_for(s, client_val)
-                    pend = get_or_make_pending(host)
                     pend.remove_tags.append(gt)
+
         elif kind == "taildrop":
             for sender, receiver in parse_taildrop_specs(op[1:]):
                 remove_taildrop_grant(policy_after, sender, receiver, mutual=args.mutual)
