@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-#!/usr/bin/env python3
 """
 tailscale.py (Tailscale policy + tagging helper)
 
@@ -1934,6 +1933,8 @@ class TailShell(cmd.Cmd):
         self.fix_enabled = False
         self.allow_owner_change = False
         self.push_allowed = False
+        self.allow_all: Optional[str] = None
+        self.grant_gc: Optional[bool] = None
 
         self.policy_before: Optional[Dict[str, Any]] = None
         self.policy_after: Optional[Dict[str, Any]] = None
@@ -1966,6 +1967,8 @@ class TailShell(cmd.Cmd):
         print(f"fix_enabled={self.fix_enabled}")
         print(f"allow_owner_change={self.allow_owner_change}")
         print(f"push_allowed={self.push_allowed}")
+        print(f"allow_all={self.allow_all!r}")
+        print(f"grant_gc={self.grant_gc!r}")
 
     def do_set(self, line: str) -> None:
         """Set a config value. Usage: set <key> <value>"""
@@ -1975,20 +1978,26 @@ class TailShell(cmd.Cmd):
         key = parts[0].lower()
         val = " ".join(parts[1:])
 
+        # Helper function to parse boolean values
+        def parse_bool_value(v: str) -> bool:
+            return v.lower() in ("1", "true", "yes", "on")
+
+        # Helper function to handle unset values
+        def handle_unset(v: str):
+            return v.lower() in ("unset", "none", "null")
+
         if key in ("tailnet",):
             self.tailnet = val
         elif key in ("api_key", "apikey", "api-key"):
             self.api_key = val
         elif key in ("owner", "owner_email", "owner-email"):
             self.owner = val
-        elif key == "dry_run":
-            self.dry_run = val.lower() in ("1", "true", "yes", "on")
-        elif key == "fix":
-            self.fix_enabled = val.lower() in ("1", "true", "yes", "on")
-        elif key == "allow_owner_change":
-            self.allow_owner_change = val.lower() in ("1", "true", "yes", "on")
-        elif key == "push":
-            self.push_allowed = val.lower() in ("1", "true", "yes", "on")
+        elif key in ("dry_run", "fix", "allow_owner_change", "push"):
+            setattr(self, {"dry_run": "dry_run", "fix": "fix_enabled", "allow_owner_change": "allow_owner_change", "push": "push_allowed"}[key], parse_bool_value(val))
+        elif key == "allow_all":
+            self.allow_all = None if handle_unset(val) else parse_bool_value(val)
+        elif key == "grant_gc":
+            self.grant_gc = None if handle_unset(val) else parse_bool_value(val)
         else:
             die(f"Unknown key {key!r}")
         print("ok")
