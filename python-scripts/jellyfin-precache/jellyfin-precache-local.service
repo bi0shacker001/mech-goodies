@@ -1,0 +1,13 @@
+[Unit]
+Description=Jellyfin Prefetch Service (local)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/jellyfin-precache/jellyfin-precache.env
+ExecStart=/opt/jellyfin-precache/jellyfin-precache.py --local
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

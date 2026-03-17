@@ -98,7 +98,9 @@ from __future__ import annotations
 
 import argparse
 import cmd
+import contextlib
 import copy
+import io
 import json
 import os
 import re
@@ -214,6 +216,24 @@ def load_env_file(path: str) -> Dict[str, str]:
 
 
 MECH_ENV = load_env_file(MECH_ENV_PATH)
+
+
+@contextlib.contextmanager
+def _guard_die():
+    """
+    Redirect stderr and convert die() SystemExit into RuntimeError so TUI
+    workers can catch and display the message without crashing the app.
+    """
+    buf = io.StringIO()
+    old = sys.stderr
+    sys.stderr = buf
+    try:
+        yield
+    except SystemExit as e:
+        msg = buf.getvalue().strip() or f"Exit code {e.code}"
+        raise RuntimeError(msg) from None
+    finally:
+        sys.stderr = old
 
 
 def cfg_get(key: str, default: str) -> str:
@@ -2160,6 +2180,1080 @@ Examples:
   tailscale-api --pull --add taildrop devrole-client:devrole-server --mutual --fix --push
 """
 
+# ============================================================
+# Textual TUI  (--ui flag)
+# ============================================================
+
+try:
+    from textual.app import App as _App, ComposeResult as _CR
+    from textual.binding import Binding as _Binding
+    from textual.containers import Container as _Cont, Horizontal as _H, Vertical as _V
+    from textual.containers import ScrollableContainer as _Scroll
+    from textual.screen import Screen as _Screen, ModalScreen as _Modal
+    from textual.widgets import (
+        Button as _Btn, DataTable as _DT, Footer as _Footer, Header as _Header,
+        Input as _Input, Label as _Label, Select as _Sel,
+        Static as _Static, TextArea as _TA,
+    )
+    from textual import on as _on, work as _work
+
+    # ── Shared modals ─────────────────────────────────────────────────────────
+
+    class _MsgModal(_Modal):
+        BINDINGS = [_Binding("escape,enter,space", "dismiss", "Close")]
+
+        def __init__(self, title: str, message: str, is_error: bool = False):
+            super().__init__()
+            self._title = title
+            self._message = message
+            self._is_error = is_error
+
+        def compose(self) -> _CR:
+            colour = "red" if self._is_error else "green"
+            with _Cont(id="tm-box"):
+                yield _Label(f"[bold {colour}]{self._title}[/]")
+                yield _Static(self._message)
+                yield _Btn("OK", id="ok-btn", variant="primary")
+
+        @_on(_Btn.Pressed, "#ok-btn")
+        def close(self) -> None:
+            self.dismiss()
+
+    class _ConfirmModal(_Modal):
+        BINDINGS = [_Binding("escape", "cancel", "Cancel")]
+
+        def __init__(self, message: str):
+            super().__init__()
+            self._message = message
+
+        def compose(self) -> _CR:
+            with _Cont(id="tm-box"):
+                yield _Label("[bold yellow]Confirm[/]")
+                yield _Static(self._message)
+                with _H(id="tm-btns"):
+                    yield _Btn("Yes", id="yes-btn", variant="error")
+                    yield _Btn("No",  id="no-btn",  variant="primary")
+
+        @_on(_Btn.Pressed, "#yes-btn")
+        def yes(self) -> None:
+            self.dismiss(True)
+
+        @_on(_Btn.Pressed, "#no-btn")
+        def no(self) -> None:
+            self.dismiss(False)
+
+        def action_cancel(self) -> None:
+            self.dismiss(False)
+
+    # ── Login ─────────────────────────────────────────────────────────────────
+
+    class _LoginScreen(_Screen):
+        def compose(self) -> _CR:
+            env = load_env_file(MECH_ENV_PATH)
+            api_key     = env.get("TAILSCALE_API_KEY", "")           or os.environ.get("TAILSCALE_API_KEY", "")
+            tailnet     = env.get("TAILSCALE_TAILNET", "-")          or os.environ.get("TAILSCALE_TAILNET", "-") or "-"
+            owner       = env.get("TAILSCALE_OWNER_EMAIL", "")       or os.environ.get("TAILSCALE_OWNER_EMAIL", "")
+            oauth_id    = env.get("TAILSCALE_OAUTH_CLIENT_ID", "")   or os.environ.get("TS_API_CLIENT_ID", "")
+            oauth_sec   = env.get("TAILSCALE_OAUTH_CLIENT_SECRET","") or os.environ.get("TS_API_CLIENT_SECRET", "")
+            has_creds   = bool(api_key or (oauth_id and oauth_sec))
+            hint        = "Credentials loaded — connecting…" if has_creds else "Enter credentials to connect:"
+            yield _Header()
+            with _Cont(id="ts-login"):
+                yield _Label("[bold cyan]Tailscale Manager[/]", id="ts-login-title")
+                yield _Label(f"[dim]{MECH_ENV_PATH}[/]")
+                yield _Label(hint, id="ts-login-hint")
+                yield _Label("API Key  [dim](leave blank to use OAuth)[/]")
+                yield _Input(placeholder="tskey-api-…", value=api_key, password=True, id="apikey-in")
+                yield _Label("OAuth Client ID  [dim](alternative to API key)[/]")
+                yield _Input(placeholder="tskey-client-…", value=oauth_id, id="oauth-id-in")
+                yield _Label("OAuth Client Secret")
+                yield _Input(placeholder="tskey-…", value=oauth_sec, password=True, id="oauth-sec-in")
+                yield _Label("Tailnet  [dim](- = this token's tailnet)[/]")
+                yield _Input(placeholder="-", value=tailnet, id="tailnet-in")
+                yield _Label("Owner email  [dim](for tagOwners; can be blank if read-only)[/]")
+                yield _Input(placeholder="admin@example.com", value=owner, id="owner-in")
+                yield _Btn("Connect", id="connect-btn", variant="primary")
+                yield _Label("", id="ts-login-err")
+            yield _Footer()
+
+        def on_mount(self) -> None:
+            env = load_env_file(MECH_ENV_PATH)
+            api_key   = env.get("TAILSCALE_API_KEY", "")           or os.environ.get("TAILSCALE_API_KEY", "")
+            tailnet   = env.get("TAILSCALE_TAILNET", "-")          or os.environ.get("TAILSCALE_TAILNET", "-") or "-"
+            owner     = env.get("TAILSCALE_OWNER_EMAIL", "")       or os.environ.get("TAILSCALE_OWNER_EMAIL", "")
+            oauth_id  = env.get("TAILSCALE_OAUTH_CLIENT_ID", "")   or os.environ.get("TS_API_CLIENT_ID", "")
+            oauth_sec = env.get("TAILSCALE_OAUTH_CLIENT_SECRET","") or os.environ.get("TS_API_CLIENT_SECRET", "")
+            if api_key or (oauth_id and oauth_sec):
+                self._try_connect(api_key, oauth_id, oauth_sec, tailnet, owner)
+
+        @_on(_Btn.Pressed, "#connect-btn")
+        def do_connect(self) -> None:
+            api_key   = self.query_one("#apikey-in",   _Input).value.strip()
+            oauth_id  = self.query_one("#oauth-id-in", _Input).value.strip()
+            oauth_sec = self.query_one("#oauth-sec-in",_Input).value.strip()
+            tailnet   = self.query_one("#tailnet-in",  _Input).value.strip() or "-"
+            owner     = self.query_one("#owner-in",    _Input).value.strip()
+            if not api_key and not (oauth_id and oauth_sec):
+                self.query_one("#ts-login-err", _Label).update("[red]Provide an API key or OAuth client ID + secret.[/]")
+                return
+            self._try_connect(api_key, oauth_id, oauth_sec, tailnet, owner)
+
+        @_work(exclusive=True)
+        async def _try_connect(self, api_key: str, oauth_id: str, oauth_sec: str,
+                               tailnet: str, owner: str) -> None:
+            import asyncio
+            err = self.query_one("#ts-login-err", _Label)
+            ctx = AuthContext(tailnet=tailnet, api_key=api_key,
+                              oauth_client_id=oauth_id, oauth_client_secret=oauth_sec)
+            try:
+                with _guard_die():
+                    token   = await asyncio.get_event_loop().run_in_executor(None, ctx.token)
+                    devices = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: api_list_devices(tailnet, token))
+            except (RuntimeError, Exception) as e:
+                err.update(f"[red]{e}[/]")
+                return
+            self.app.ts_auth    = ctx
+            self.app.ts_owner   = owner
+            self.app.ts_devices = devices
+            self.app.push_screen(_MainScreen())
+
+    # ── Main hub ──────────────────────────────────────────────────────────────
+
+    class _MainScreen(_Screen):
+        BINDINGS = [
+            _Binding("d", "go_devices",    "Devices"),
+            _Binding("s", "go_services",   "Services"),
+            _Binding("b", "go_base_tags",  "Base Tags"),
+            _Binding("g", "go_grants",     "Grants"),
+            _Binding("v", "go_validation", "Validation"),
+            _Binding("p", "pull_policy",   "Pull Policy"),
+            _Binding("q", "quit_app",      "Quit"),
+        ]
+
+        def compose(self) -> _CR:
+            yield _Header()
+            with _V(id="ts-main"):
+                yield _Label("[bold cyan]Tailscale Manager[/]", id="ts-main-title")
+                yield _Label("", id="ts-status")
+                with _H(id="ts-main-btns"):
+                    yield _Btn("Devices (d)",    id="dev-btn")
+                    yield _Btn("Services (s)",   id="svc-btn",   variant="primary")
+                    yield _Btn("Base Tags (b)",  id="base-btn",  variant="primary")
+                    yield _Btn("Grants (g)",     id="grant-btn", variant="primary")
+                    yield _Btn("Validation (v)", id="val-btn",   variant="success")
+                    yield _Btn("Pull Policy (p)",id="pull-btn")
+                    yield _Btn("Quit (q)",       id="quit-btn",  variant="error")
+            yield _Footer()
+
+        def on_mount(self) -> None:
+            self._update_status()
+
+        def on_resume(self) -> None:
+            self._update_status()
+
+        def _update_status(self) -> None:
+            a = self.app
+            tailnet   = a.ts_auth.tailnet if a.ts_auth else "?"
+            dev_count = len(a.ts_devices)
+            if a.ts_policy is None:
+                pol = "[dim]not pulled[/]"
+            elif a.ts_dirty:
+                pol = "[yellow]modified — not pushed[/]"
+            else:
+                pol = "[green]clean[/]"
+            svc_count = len(list_services(a.ts_policy)) if a.ts_policy else "?"
+            self.query_one("#ts-status", _Label).update(
+                f"Tailnet: [bold]{tailnet}[/]   Devices: {dev_count}   "
+                f"Services: {svc_count}   Policy: {pol}"
+            )
+
+        @_work(exclusive=True)
+        async def _do_pull(self) -> None:
+            import asyncio
+            try:
+                with _guard_die():
+                    token  = await asyncio.get_event_loop().run_in_executor(None, self.app.ts_auth.token)
+                    policy = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: api_pull_policy(self.app.ts_auth.tailnet, token))
+                ensure_policy_shape(policy)
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Pull Error", str(e), is_error=True))
+                return
+            self.app.ts_policy = policy
+            self.app.ts_dirty  = False
+            self._update_status()
+
+        def action_pull_policy(self) -> None:
+            self._do_pull()
+
+        def action_go_devices(self)    -> None: self.app.push_screen(_DeviceListScreen())
+        def action_go_services(self)   -> None: self.app.push_screen(_ServiceListScreen())
+        def action_go_base_tags(self)  -> None: self.app.push_screen(_BaseTagListScreen())
+        def action_go_grants(self)     -> None: self.app.push_screen(_GrantListScreen())
+        def action_go_validation(self) -> None: self.app.push_screen(_ValidationScreen())
+        def action_quit_app(self)      -> None: self.app.exit()
+
+        @_on(_Btn.Pressed, "#dev-btn")
+        def on_dev(self)   -> None: self.action_go_devices()
+        @_on(_Btn.Pressed, "#svc-btn")
+        def on_svc(self)   -> None: self.action_go_services()
+        @_on(_Btn.Pressed, "#base-btn")
+        def on_base(self)  -> None: self.action_go_base_tags()
+        @_on(_Btn.Pressed, "#grant-btn")
+        def on_grant(self) -> None: self.action_go_grants()
+        @_on(_Btn.Pressed, "#val-btn")
+        def on_val(self)   -> None: self.action_go_validation()
+        @_on(_Btn.Pressed, "#pull-btn")
+        def on_pull(self)  -> None: self.action_pull_policy()
+        @_on(_Btn.Pressed, "#quit-btn")
+        def on_quit(self)  -> None: self.action_quit_app()
+
+    # ── Device list ───────────────────────────────────────────────────────────
+
+    class _DeviceListScreen(_Screen):
+        BINDINGS = [
+            _Binding("escape,b", "go_back",    "Back"),
+            _Binding("e",        "edit_tags",   "Edit Tags"),
+            _Binding("r",        "refresh",     "Refresh"),
+        ]
+
+        def compose(self) -> _CR:
+            yield _Header()
+            with _V(id="ts-dev-screen"):
+                yield _Label("[bold cyan]Tailscale Devices[/]", id="ts-dev-title")
+                yield _DT(id="ts-dev-table", cursor_type="row")
+                with _H(id="ts-dev-actions"):
+                    yield _Btn("Edit Tags (e)", id="edit-btn", variant="primary")
+                    yield _Btn("Refresh (r)",   id="ref-btn")
+                    yield _Btn("Back (Esc)",    id="back-btn")
+            yield _Footer()
+
+        def on_mount(self) -> None:
+            t = self.query_one("#ts-dev-table", _DT)
+            t.add_columns("Hostname", "ID", "Tags")
+            self._populate()
+
+        def _populate(self) -> None:
+            t = self.query_one("#ts-dev-table", _DT)
+            t.clear()
+            for d in self.app.ts_devices:
+                tags = ", ".join(d.get("tags") or []) or "[dim]none[/]"
+                t.add_row(
+                    d.get("name") or d.get("hostname", ""),
+                    d.get("id", ""),
+                    tags,
+                    key=d.get("id"),
+                )
+
+        def _selected(self) -> dict | None:
+            t   = self.query_one("#ts-dev-table", _DT)
+            devs = self.app.ts_devices
+            if not devs or t.cursor_row < 0 or t.cursor_row >= len(devs):
+                return None
+            return devs[t.cursor_row]
+
+        def action_go_back(self) -> None:
+            self.app.pop_screen()
+
+        @_work(exclusive=True)
+        async def _do_refresh(self) -> None:
+            import asyncio
+            try:
+                with _guard_die():
+                    token = await asyncio.get_event_loop().run_in_executor(None, self.app.ts_auth.token)
+                    devs  = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: api_list_devices(self.app.ts_auth.tailnet, token))
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+                return
+            self.app.ts_devices = devs
+            self._populate()
+
+        def action_refresh(self) -> None:
+            self._do_refresh()
+
+        def action_edit_tags(self) -> None:
+            d = self._selected()
+            if d:
+                self.app.push_screen(_EditTagsModal(d), self._save_tags)
+
+        def _save_tags(self, result: tuple | None) -> None:
+            if result is None:
+                return
+            device_id, new_tags = result
+            self._apply_tags(device_id, new_tags)
+
+        @_work(exclusive=True)
+        async def _apply_tags(self, device_id: str, tags: list) -> None:
+            import asyncio
+            try:
+                with _guard_die():
+                    token = await asyncio.get_event_loop().run_in_executor(None, self.app.ts_auth.token)
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: api_set_device_tags(device_id, token, tags))
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+                return
+            self._do_refresh()
+
+        @_on(_Btn.Pressed, "#edit-btn")
+        def on_edit(self) -> None: self.action_edit_tags()
+        @_on(_Btn.Pressed, "#ref-btn")
+        def on_ref(self)  -> None: self.action_refresh()
+        @_on(_Btn.Pressed, "#back-btn")
+        def on_back(self) -> None: self.action_go_back()
+
+    # ── Edit device tags modal ─────────────────────────────────────────────────
+
+    class _EditTagsModal(_Modal):
+        BINDINGS = [_Binding("escape", "cancel", "Cancel")]
+
+        def __init__(self, device: dict):
+            super().__init__()
+            self._device = device
+
+        def compose(self) -> _CR:
+            name = self._device.get("name") or self._device.get("hostname", "?")
+            current = "\n".join(self._device.get("tags") or [])
+            with _Cont(id="tm-box", classes="wide"):
+                yield _Label(f"[bold cyan]Edit Tags — {name}[/]")
+                yield _Static("[dim]One tag per line, e.g. tag:owner-alice   (tag: prefix required)[/]")
+                yield _TA(current, id="tags-area")
+                with _H(id="tm-btns"):
+                    yield _Btn("Save",   id="save-btn",   variant="success")
+                    yield _Btn("Cancel", id="cancel-btn")
+
+        @_on(_Btn.Pressed, "#save-btn")
+        def do_save(self) -> None:
+            raw  = self.query_one("#tags-area", _TA).text.strip()
+            tags = [t.strip() for t in raw.splitlines() if t.strip()]
+            self.dismiss((self._device["id"], tags))
+
+        @_on(_Btn.Pressed, "#cancel-btn")
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+    # ── Service list ──────────────────────────────────────────────────────────
+
+    class _ServiceListScreen(_Screen):
+        BINDINGS = [
+            _Binding("escape,b", "go_back",        "Back"),
+            _Binding("a",        "add_service",     "Add"),
+            _Binding("d",        "remove_service",  "Remove"),
+            _Binding("r",        "refresh",         "Refresh"),
+        ]
+
+        def compose(self) -> _CR:
+            yield _Header()
+            with _V(id="ts-svc-screen"):
+                yield _Label("[bold cyan]Services[/]", id="ts-svc-title")
+                yield _Static("[dim]Changes are in-memory — use Validation to push.[/]")
+                yield _DT(id="ts-svc-table", cursor_type="row")
+                with _H(id="ts-svc-actions"):
+                    yield _Btn("Add (a)",    id="add-btn", variant="success")
+                    yield _Btn("Remove (d)", id="del-btn", variant="error")
+                    yield _Btn("Refresh (r)",id="ref-btn")
+                    yield _Btn("Back (Esc)", id="back-btn")
+            yield _Footer()
+
+        def on_mount(self) -> None:
+            self.query_one("#ts-svc-table", _DT).add_columns("Service", "Ports")
+            if self.app.ts_policy is None:
+                self._pull_and_populate()
+            else:
+                self._populate()
+
+        def _populate(self) -> None:
+            policy = self.app.ts_policy
+            t = self.query_one("#ts-svc-table", _DT)
+            t.clear()
+            if not policy:
+                return
+            ports_map = infer_service_ip_from_grants(policy)
+            for svc in sorted(list_services(policy)):
+                ports = ", ".join(ports_map.get(svc, [])) or "[dim]no ports[/]"
+                t.add_row(svc, ports, key=svc)
+
+        @_work(exclusive=True)
+        async def _pull_and_populate(self) -> None:
+            import asyncio
+            try:
+                with _guard_die():
+                    token  = await asyncio.get_event_loop().run_in_executor(None, self.app.ts_auth.token)
+                    policy = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: api_pull_policy(self.app.ts_auth.tailnet, token))
+                ensure_policy_shape(policy)
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+                return
+            self.app.ts_policy = policy
+            self.app.ts_dirty  = False
+            self._populate()
+
+        def action_refresh(self)  -> None: self._pull_and_populate()
+        def action_go_back(self)  -> None: self.app.pop_screen()
+
+        def action_add_service(self) -> None:
+            self.app.push_screen(_AddServiceModal(), self._handle_add)
+
+        def _handle_add(self, result: dict | None) -> None:
+            if not result or not self.app.ts_policy:
+                return
+            try:
+                with _guard_die():
+                    add_service(self.app.ts_policy,
+                                self.app.ts_owner or "owner@example.com",
+                                result["name"], result["ports"])
+                self.app.ts_dirty = True
+                self._populate()
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+
+        def action_remove_service(self) -> None:
+            t      = self.query_one("#ts-svc-table", _DT)
+            policy = self.app.ts_policy
+            if not policy or t.cursor_row < 0:
+                return
+            svcs = sorted(list_services(policy))
+            if t.cursor_row >= len(svcs):
+                return
+            svc = svcs[t.cursor_row]
+            self.app.push_screen(
+                _ConfirmModal(f"Remove service [bold]{svc}[/]?\nThis removes its tagOwner and all related grants."),
+                lambda ok: self._do_remove_svc(svc) if ok else None,
+            )
+
+        def _do_remove_svc(self, svc: str) -> None:
+            try:
+                with _guard_die():
+                    rm_service(self.app.ts_policy, svc)
+                self.app.ts_dirty = True
+                self._populate()
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+
+        @_on(_Btn.Pressed, "#add-btn")
+        def on_add(self)  -> None: self.action_add_service()
+        @_on(_Btn.Pressed, "#del-btn")
+        def on_del(self)  -> None: self.action_remove_service()
+        @_on(_Btn.Pressed, "#ref-btn")
+        def on_ref(self)  -> None: self.action_refresh()
+        @_on(_Btn.Pressed, "#back-btn")
+        def on_back(self) -> None: self.action_go_back()
+
+    # ── Add service modal ─────────────────────────────────────────────────────
+
+    class _AddServiceModal(_Modal):
+        BINDINGS = [_Binding("escape", "cancel", "Cancel")]
+
+        def compose(self) -> _CR:
+            with _Cont(id="tm-box"):
+                yield _Label("[bold cyan]Add Service[/]")
+                yield _Label("Service name  [dim](letters/digits/dashes)[/]")
+                yield _Input(placeholder="sonarr", id="name-in")
+                yield _Label("Ports  [dim](e.g. 8989, 80,443, 8096/tcp)[/]")
+                yield _Input(placeholder="8989", id="ports-in")
+                with _H(id="tm-btns"):
+                    yield _Btn("Add",    id="add-btn", variant="success")
+                    yield _Btn("Cancel", id="cancel-btn")
+
+        @_on(_Btn.Pressed, "#add-btn")
+        @_on(_Input.Submitted, "#ports-in")
+        def do_add(self) -> None:
+            name  = self.query_one("#name-in",  _Input).value.strip()
+            ports = self.query_one("#ports-in", _Input).value.strip()
+            if not name or not ports:
+                self.app.push_screen(_MsgModal("Error", "Name and ports are required.", is_error=True))
+                return
+            self.dismiss({"name": name, "ports": ports})
+
+        @_on(_Btn.Pressed, "#cancel-btn")
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+    # ── Base tag list ─────────────────────────────────────────────────────────
+
+    class _BaseTagListScreen(_Screen):
+        BINDINGS = [
+            _Binding("escape,b", "go_back",     "Back"),
+            _Binding("a",        "add_tag",      "Add"),
+            _Binding("d",        "remove_tag",   "Remove"),
+            _Binding("r",        "refresh",      "Refresh"),
+        ]
+
+        def compose(self) -> _CR:
+            yield _Header()
+            with _V(id="ts-base-screen"):
+                yield _Label("[bold cyan]Base Tags[/]", id="ts-base-title")
+                yield _Static("[dim]owner-*, devrole-*, ownerdept-*, devdept-* — changes are in-memory only.[/]")
+                yield _DT(id="ts-base-table", cursor_type="row")
+                with _H(id="ts-base-actions"):
+                    yield _Btn("Add (a)",    id="add-btn", variant="success")
+                    yield _Btn("Remove (d)", id="del-btn", variant="error")
+                    yield _Btn("Refresh (r)",id="ref-btn")
+                    yield _Btn("Back (Esc)", id="back-btn")
+            yield _Footer()
+
+        def on_mount(self) -> None:
+            self.query_one("#ts-base-table", _DT).add_columns("Tag", "Owners")
+            if self.app.ts_policy is None:
+                self._pull_and_populate()
+            else:
+                self._populate()
+
+        def _populate(self) -> None:
+            policy = self.app.ts_policy
+            t = self.query_one("#ts-base-table", _DT)
+            t.clear()
+            if not policy:
+                return
+            for tag in sorted(list_base_tags(policy)):
+                owners = ", ".join(policy.get("tagOwners", {}).get(tag, []))
+                t.add_row(tag, owners or "[dim]—[/]", key=tag)
+
+        @_work(exclusive=True)
+        async def _pull_and_populate(self) -> None:
+            import asyncio
+            try:
+                with _guard_die():
+                    token  = await asyncio.get_event_loop().run_in_executor(None, self.app.ts_auth.token)
+                    policy = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: api_pull_policy(self.app.ts_auth.tailnet, token))
+                ensure_policy_shape(policy)
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+                return
+            self.app.ts_policy = policy
+            self.app.ts_dirty  = False
+            self._populate()
+
+        def action_refresh(self) -> None: self._pull_and_populate()
+        def action_go_back(self) -> None: self.app.pop_screen()
+
+        def action_add_tag(self) -> None:
+            self.app.push_screen(_AddBaseTagModal(), self._handle_add)
+
+        def _handle_add(self, tag: str | None) -> None:
+            if not tag or not self.app.ts_policy:
+                return
+            try:
+                with _guard_die():
+                    add_base(self.app.ts_policy, self.app.ts_owner or "owner@example.com", [tag])
+                self.app.ts_dirty = True
+                self._populate()
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+
+        def action_remove_tag(self) -> None:
+            t      = self.query_one("#ts-base-table", _DT)
+            policy = self.app.ts_policy
+            if not policy or t.cursor_row < 0:
+                return
+            tags = sorted(list_base_tags(policy))
+            if t.cursor_row >= len(tags):
+                return
+            tag = tags[t.cursor_row]
+            self.app.push_screen(
+                _ConfirmModal(f"Remove base tag [bold]{tag}[/] and its tagOwner entry?"),
+                lambda ok: self._do_remove(tag) if ok else None,
+            )
+
+        def _do_remove(self, tag: str) -> None:
+            try:
+                with _guard_die():
+                    rm_base(self.app.ts_policy, [tag])
+                self.app.ts_dirty = True
+                self._populate()
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+
+        @_on(_Btn.Pressed, "#add-btn")
+        def on_add(self)  -> None: self.action_add_tag()
+        @_on(_Btn.Pressed, "#del-btn")
+        def on_del(self)  -> None: self.action_remove_tag()
+        @_on(_Btn.Pressed, "#ref-btn")
+        def on_ref(self)  -> None: self.action_refresh()
+        @_on(_Btn.Pressed, "#back-btn")
+        def on_back(self) -> None: self.action_go_back()
+
+    # ── Add base tag modal ────────────────────────────────────────────────────
+
+    class _AddBaseTagModal(_Modal):
+        BINDINGS = [_Binding("escape", "cancel", "Cancel")]
+
+        def compose(self) -> _CR:
+            with _Cont(id="tm-box"):
+                yield _Label("[bold cyan]Add Base Tag[/]")
+                yield _Static("[dim]Examples: owner-alice, devrole-server, devdept-homelab[/]")
+                yield _Input(placeholder="owner-alice", id="tag-in")
+                with _H(id="tm-btns"):
+                    yield _Btn("Add",    id="add-btn", variant="success")
+                    yield _Btn("Cancel", id="cancel-btn")
+
+        @_on(_Btn.Pressed, "#add-btn")
+        @_on(_Input.Submitted, "#tag-in")
+        def do_add(self) -> None:
+            tag = self.query_one("#tag-in", _Input).value.strip()
+            if not tag:
+                self.app.push_screen(_MsgModal("Error", "Tag name is required.", is_error=True))
+                return
+            self.dismiss(tag)
+
+        @_on(_Btn.Pressed, "#cancel-btn")
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+    # ── Validation + push ─────────────────────────────────────────────────────
+
+    class _ValidationScreen(_Screen):
+        BINDINGS = [
+            _Binding("escape,b", "go_back",           "Back"),
+            _Binding("p",        "push_policy",        "Push"),
+            _Binding("f",        "fix_fixable",        "Fix Fixable"),
+            _Binding("v",        "remote_validate",    "Remote Validate"),
+            _Binding("g",        "grant_gc",           "Grant GC"),
+            _Binding("r",        "refresh",            "Refresh"),
+        ]
+
+        def compose(self) -> _CR:
+            yield _Header()
+            with _V(id="ts-val-screen"):
+                yield _Label("[bold cyan]Validation & Push[/]", id="ts-val-title")
+                yield _Label("", id="ts-val-status")
+                yield _DT(id="ts-val-table", cursor_type="row")
+                with _H(id="ts-val-actions"):
+                    yield _Btn("Push (p)",             id="push-btn",   variant="success")
+                    yield _Btn("Fix Fixable (f)",      id="fix-btn",    variant="warning")
+                    yield _Btn("Remote Validate (v)",  id="rval-btn")
+                    yield _Btn("Grant GC (g)",         id="gc-btn")
+                    yield _Btn("Re-pull (r)",          id="ref-btn")
+                    yield _Btn("Back (Esc)",           id="back-btn")
+            yield _Footer()
+
+        def on_mount(self) -> None:
+            self.query_one("#ts-val-table", _DT).add_columns("Kind", "Message", "Fixable")
+            if self.app.ts_policy is None:
+                self._pull_and_validate()
+            else:
+                self._validate()
+
+        def _validate(self) -> None:
+            policy = self.app.ts_policy
+            t      = self.query_one("#ts-val-table", _DT)
+            status = self.query_one("#ts-val-status", _Label)
+            t.clear()
+            if not policy:
+                status.update("[red]No policy loaded — press r to pull.[/]")
+                return
+            issues = collect_policy_issues(policy)
+            dirty  = "  [yellow](unsaved changes)[/]" if self.app.ts_dirty else "  [green](no unsaved changes)[/]"
+            if issues:
+                status.update(f"[yellow]{len(issues)} issue(s) found[/]{dirty}")
+            else:
+                status.update(f"[green]Policy is valid.[/]{dirty}")
+            for iss in issues:
+                t.add_row(
+                    iss.kind,
+                    iss.msg,
+                    "[green]Yes[/]" if iss.fixable else "[red]No[/]",
+                )
+
+        @_work(exclusive=True)
+        async def _pull_and_validate(self) -> None:
+            import asyncio
+            try:
+                with _guard_die():
+                    token  = await asyncio.get_event_loop().run_in_executor(None, self.app.ts_auth.token)
+                    policy = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: api_pull_policy(self.app.ts_auth.tailnet, token))
+                ensure_policy_shape(policy)
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+                return
+            self.app.ts_policy = policy
+            self.app.ts_dirty  = False
+            self._validate()
+
+        def action_refresh(self)  -> None: self._pull_and_validate()
+        def action_go_back(self)  -> None: self.app.pop_screen()
+
+        def action_fix_fixable(self) -> None:
+            if not self.app.ts_policy:
+                self.app.push_screen(_MsgModal("Error", "No policy loaded.", is_error=True))
+                return
+            issues   = collect_policy_issues(self.app.ts_policy)
+            fixables = [i for i in issues if i.fixable]
+            if not fixables:
+                self.app.push_screen(_MsgModal("Fix Fixable", "No fixable issues found."))
+                return
+            self.app.push_screen(
+                _ConfirmModal(f"Apply {len(fixables)} fix(es) to in-memory policy?"),
+                lambda ok: self._do_fix_fixable(fixables) if ok else None,
+            )
+
+        def _do_fix_fixable(self, fixables) -> None:
+            notes = apply_policy_fixes(self.app.ts_policy, self.app.ts_owner, fixables)
+            self.app.ts_dirty = True
+            self._validate()
+            summary = "\n".join(notes) if notes else "No changes made."
+            self.app.push_screen(_MsgModal("Fixed", summary))
+
+        def action_remote_validate(self) -> None:
+            if not self.app.ts_policy:
+                self.app.push_screen(_MsgModal("Error", "No policy loaded.", is_error=True))
+                return
+            self._do_remote_validate()
+
+        @_work(exclusive=True)
+        async def _do_remote_validate(self) -> None:
+            import asyncio
+            status = self.query_one("#ts-val-status", _Label)
+            status.update("[yellow]Remote validating…[/]")
+            try:
+                with _guard_die():
+                    token = await asyncio.get_event_loop().run_in_executor(None, self.app.ts_auth.token)
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: api_validate_policy(
+                            self.app.ts_auth.tailnet, token, self.app.ts_policy))
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Remote Validation Error", str(e), is_error=True))
+                self._validate()
+                return
+            self.app.push_screen(_MsgModal("Remote Validate", "Tailscale accepted the policy — no errors."))
+            self._validate()
+
+        def action_grant_gc(self) -> None:
+            if not self.app.ts_policy:
+                self.app.push_screen(_MsgModal("Error", "No policy loaded.", is_error=True))
+                return
+            self._do_grant_gc_check()
+
+        @_work(exclusive=True)
+        async def _do_grant_gc_check(self) -> None:
+            import asyncio
+            status = self.query_one("#ts-val-status", _Label)
+            status.update("[yellow]Scanning for unused grant tags…[/]")
+            try:
+                with _guard_die():
+                    token  = await asyncio.get_event_loop().run_in_executor(None, self.app.ts_auth.token)
+                    issues = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: collect_unused_grant_tag_issues(
+                            self.app.ts_policy, self.app.ts_auth.tailnet, token))
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Grant GC Error", str(e), is_error=True))
+                self._validate()
+                return
+            if not issues:
+                self.app.push_screen(_MsgModal("Grant GC", "No unused grant tags found."))
+                self._validate()
+                return
+            tags = "\n".join(i.data["tag"] for i in issues)
+            self.app.push_screen(
+                _ConfirmModal(f"Remove {len(issues)} unused grant tag(s)?\n{tags}"),
+                lambda ok: self._apply_gc(issues) if ok else self._validate(),
+            )
+
+        def _apply_gc(self, issues) -> None:
+            notes = apply_grant_gc_fixes(self.app.ts_policy, issues)
+            self.app.ts_dirty = True
+            self._validate()
+            summary = "\n".join(notes) if notes else "No changes made."
+            self.app.push_screen(_MsgModal("Grant GC", summary))
+
+        def action_push_policy(self) -> None:
+            if not self.app.ts_policy:
+                self.app.push_screen(_MsgModal("Error", "No policy loaded.", is_error=True))
+                return
+            unfixable = [i for i in collect_policy_issues(self.app.ts_policy) if not i.fixable]
+            if unfixable:
+                self.app.push_screen(_MsgModal("Cannot Push",
+                    f"{len(unfixable)} unfixable issue(s). Resolve them before pushing.",
+                    is_error=True))
+                return
+            self.app.push_screen(
+                _ConfirmModal("Push modified policy to tailnet?\n[yellow]This replaces the live ACL policy.[/]"),
+                lambda ok: self._do_push() if ok else None,
+            )
+
+        @_work(exclusive=True)
+        async def _do_push(self) -> None:
+            import asyncio
+            try:
+                with _guard_die():
+                    token = await asyncio.get_event_loop().run_in_executor(None, self.app.ts_auth.token)
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: api_push_policy(self.app.ts_auth.tailnet, token, self.app.ts_policy))
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Push Error", str(e), is_error=True))
+                return
+            self.app.ts_dirty = False
+            self.app.push_screen(_MsgModal("Success", "Policy pushed to tailnet!"))
+            self._validate()
+
+        @_on(_Btn.Pressed, "#push-btn")
+        def on_push(self)  -> None: self.action_push_policy()
+        @_on(_Btn.Pressed, "#fix-btn")
+        def on_fix(self)   -> None: self.action_fix_fixable()
+        @_on(_Btn.Pressed, "#rval-btn")
+        def on_rval(self)  -> None: self.action_remote_validate()
+        @_on(_Btn.Pressed, "#gc-btn")
+        def on_gc(self)    -> None: self.action_grant_gc()
+        @_on(_Btn.Pressed, "#ref-btn")
+        def on_ref(self)   -> None: self.action_refresh()
+        @_on(_Btn.Pressed, "#back-btn")
+        def on_back(self)  -> None: self.action_go_back()
+
+    # ── Grant list ────────────────────────────────────────────────────────────
+
+    class _GrantListScreen(_Screen):
+        BINDINGS = [
+            _Binding("escape,b", "go_back",       "Back"),
+            _Binding("a",        "add_grant",      "Add"),
+            _Binding("d",        "delete_grant",   "Remove"),
+            _Binding("r",        "refresh",        "Refresh"),
+        ]
+
+        def compose(self) -> _CR:
+            yield _Header()
+            with _V(id="ts-grant-screen"):
+                yield _Label("[bold cyan]Grant Tags[/]", id="ts-grant-title")
+                yield _Static(
+                    "[dim]Grant tags give a client-tag access to a service on tagged hosts. "
+                    "Changes are in-memory — use Validation to push.[/]"
+                )
+                yield _DT(id="ts-grant-table", cursor_type="row")
+                with _H(id="ts-grant-actions"):
+                    yield _Btn("Add (a)",    id="add-btn", variant="success")
+                    yield _Btn("Remove (d)", id="del-btn", variant="error")
+                    yield _Btn("Refresh (r)",id="ref-btn")
+                    yield _Btn("Back (Esc)", id="back-btn")
+            yield _Footer()
+
+        def on_mount(self) -> None:
+            self.query_one("#ts-grant-table", _DT).add_columns(
+                "Grant Tag", "Service", "Client Tag")
+            if self.app.ts_policy is None:
+                self._pull_and_populate()
+            else:
+                self._populate()
+
+        def _populate(self) -> None:
+            policy = self.app.ts_policy
+            t = self.query_one("#ts-grant-table", _DT)
+            t.clear()
+            if not policy:
+                return
+            for gt in sorted(set(list_grant_tags(policy))):
+                parsed = parse_grant_tag(gt)
+                svc, client_val = parsed if parsed else ("?", "?")
+                t.add_row(gt, svc, client_val, key=gt)
+
+        @_work(exclusive=True)
+        async def _pull_and_populate(self) -> None:
+            import asyncio
+            try:
+                with _guard_die():
+                    token  = await asyncio.get_event_loop().run_in_executor(None, self.app.ts_auth.token)
+                    policy = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: api_pull_policy(self.app.ts_auth.tailnet, token))
+                ensure_policy_shape(policy)
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+                return
+            self.app.ts_policy = policy
+            self.app.ts_dirty  = False
+            self._populate()
+
+        def action_refresh(self) -> None: self._pull_and_populate()
+        def action_go_back(self) -> None: self.app.pop_screen()
+
+        def action_add_grant(self) -> None:
+            policy = self.app.ts_policy
+            if not policy:
+                self.app.push_screen(_MsgModal("Error", "Pull policy first.", is_error=True))
+                return
+            services = sorted(list_services(policy))
+            if not services:
+                self.app.push_screen(_MsgModal("Error",
+                    "No services defined. Add a service first.", is_error=True))
+                return
+            base_tags = sorted(list_base_tags(policy))
+            self.app.push_screen(_AddGrantModal(services, base_tags), self._handle_add)
+
+        def _handle_add(self, result: dict | None) -> None:
+            if not result or not self.app.ts_policy:
+                return
+            try:
+                with _guard_die():
+                    ensure_grant_tag_and_rule(
+                        self.app.ts_policy,
+                        self.app.ts_owner or "owner@example.com",
+                        result["client_tag"],
+                        result["service"],
+                    )
+                self.app.ts_dirty = True
+                self._populate()
+            except (RuntimeError, Exception) as e:
+                self.app.push_screen(_MsgModal("Error", str(e), is_error=True))
+
+        def action_delete_grant(self) -> None:
+            t      = self.query_one("#ts-grant-table", _DT)
+            policy = self.app.ts_policy
+            if not policy or t.cursor_row < 0:
+                return
+            grant_tags = sorted(set(list_grant_tags(policy)))
+            if t.cursor_row >= len(grant_tags):
+                return
+            gt = grant_tags[t.cursor_row]
+            self.app.push_screen(
+                _ConfirmModal(f"Remove grant tag [bold]{gt}[/] and all its policy rules?"),
+                lambda ok: self._do_remove(gt) if ok else None,
+            )
+
+        def _do_remove(self, gt: str) -> None:
+            policy = self.app.ts_policy
+            policy["tagOwners"].pop(gt, None)
+            policy["grants"] = [
+                g for g in policy.get("grants", [])
+                if not (isinstance(g.get("dst"), list) and len(g["dst"]) == 1
+                        and g["dst"][0] == gt)
+            ]
+            self.app.ts_dirty = True
+            self._populate()
+
+        @_on(_Btn.Pressed, "#add-btn")
+        def on_add(self)  -> None: self.action_add_grant()
+        @_on(_Btn.Pressed, "#del-btn")
+        def on_del(self)  -> None: self.action_delete_grant()
+        @_on(_Btn.Pressed, "#ref-btn")
+        def on_ref(self)  -> None: self.action_refresh()
+        @_on(_Btn.Pressed, "#back-btn")
+        def on_back(self) -> None: self.action_go_back()
+
+    # ── Add grant modal ───────────────────────────────────────────────────────
+
+    class _AddGrantModal(_Modal):
+        BINDINGS = [_Binding("escape", "cancel", "Cancel")]
+
+        def __init__(self, services: list, base_tags: list):
+            super().__init__()
+            self._services  = services
+            self._base_tags = base_tags
+
+        def compose(self) -> _CR:
+            svc_opts    = [(s, s) for s in self._services]
+            client_opts = [("* (any client)", "*")] + [(t, t) for t in self._base_tags]
+            with _Cont(id="tm-box"):
+                yield _Label("[bold cyan]Add Grant[/]")
+                yield _Static("[dim]Grant rules let a client tag reach a service on hosts you tag.[/]")
+                yield _Label("Service")
+                yield _Sel(options=svc_opts,    id="svc-sel",
+                           value=self._services[0] if self._services else "")
+                yield _Label("Client tag  [dim](who gets access)[/]")
+                yield _Sel(options=client_opts, id="client-sel", value="*")
+                with _H(id="tm-btns"):
+                    yield _Btn("Add",    id="add-btn", variant="success")
+                    yield _Btn("Cancel", id="cancel-btn")
+
+        @_on(_Btn.Pressed, "#add-btn")
+        def do_add(self) -> None:
+            svc    = self.query_one("#svc-sel",    _Sel).value
+            client = self.query_one("#client-sel", _Sel).value
+            if not svc or not client:
+                self.app.push_screen(_MsgModal("Error",
+                    "Service and client tag are required.", is_error=True))
+                return
+            self.dismiss({"service": str(svc), "client_tag": str(client)})
+
+        @_on(_Btn.Pressed, "#cancel-btn")
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+    # ── CSS + App ─────────────────────────────────────────────────────────────
+
+    _TAIL_CSS = """
+    Screen { background: $surface; }
+
+    #ts-login {
+        align: center middle;
+        width: 72;
+        height: auto;
+        padding: 2 3;
+        border: round $primary;
+        background: $panel;
+    }
+    #ts-login-title { text-align: center; margin-bottom: 1; }
+    #ts-login Input  { margin-bottom: 1; }
+    #ts-login _Label { margin-top: 1; }
+
+    #ts-main { padding: 1 2; }
+    #ts-main-title { margin-bottom: 1; }
+    #ts-status { color: $text-muted; margin-bottom: 1; }
+    #ts-main-btns { height: auto; }
+    #ts-main-btns Button { margin-right: 1; }
+
+    #ts-dev-screen, #ts-svc-screen, #ts-base-screen,
+    #ts-grant-screen, #ts-val-screen { padding: 1 2; }
+    #ts-dev-title, #ts-svc-title, #ts-base-title,
+    #ts-grant-title, #ts-val-title { margin-bottom: 1; }
+    #ts-val-status { margin-bottom: 1; }
+    #ts-dev-actions, #ts-svc-actions, #ts-base-actions,
+    #ts-grant-actions, #ts-val-actions {
+        height: auto;
+        margin-top: 1;
+    }
+    #ts-dev-actions Button, #ts-svc-actions Button,
+    #ts-base-actions Button, #ts-grant-actions Button,
+    #ts-val-actions Button { margin-right: 1; }
+
+    ModalScreen { align: center middle; background: $background 60%; }
+    #tm-box {
+        width: 65;
+        height: auto;
+        max-height: 80vh;
+        padding: 2 3;
+        border: round $accent;
+        background: $panel;
+    }
+    #tm-box.wide { width: 80; }
+    #tm-box Label  { margin-bottom: 1; }
+    #tm-box Input  { margin-bottom: 1; }
+    #tm-box TextArea { height: 10; margin-bottom: 1; }
+    #tm-btns { height: auto; margin-top: 1; }
+    #tm-btns Button { margin-right: 1; }
+    """
+
+    class TailscaleApp(_App):
+        TITLE   = "Tailscale Manager"
+        CSS     = _TAIL_CSS
+        BINDINGS = [_Binding("ctrl+c", "quit", "Quit", show=False)]
+
+        ts_auth:    AuthContext = None
+        ts_policy:  dict       = None
+        ts_dirty:   bool       = False
+        ts_devices: list       = []
+        ts_owner:   str        = ""
+
+        def on_mount(self) -> None:
+            self.push_screen(_LoginScreen())
+
+    _TEXTUAL_AVAILABLE = True
+
+except ImportError:
+    _TEXTUAL_AVAILABLE = False
+
+    class TailscaleApp:  # type: ignore
+        pass
+
+
+def run_ui(args: argparse.Namespace) -> None:
+    if not _TEXTUAL_AVAILABLE:
+        print("Textual is required for --ui.  Run:  pip install textual")
+        sys.exit(1)
+    TailscaleApp().run()
+
+
 SHELL_HELP_HINT = "Type 'help ops' for the CLI-style operations syntax, or 'help flags' for full CLI flags."
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2167,6 +3261,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Interactive
     p.add_argument("--shell", action="store_true", help="Start an interactive shell (REPL).")
+    p.add_argument("--ui",    action="store_true", help="Launch the interactive Textual TUI (requires: pip install textual).")
 
     # Input
     p.add_argument("--in", dest="infile", help="Read policy from a local file (JSON5/HuJSON ok).")
@@ -2934,6 +4029,21 @@ def run_shell(args: argparse.Namespace) -> None:
 def main() -> None:
     args = build_parser().parse_args()
     auth = make_auth_context(args)
+
+    if args.ui:
+        run_ui(args)
+        return
+
+    # No meaningful operation flags supplied → launch TUI by default
+    _any_op = bool(
+        args.infile or args.pull or args.push or args.fix
+        or args.validate_remote or args.grant_gc or args.gen_devname_tags
+        or args.add or args.rm or args.allow_all is not None
+        or args.shell or args.validate or args.autotag_devnames
+    )
+    if not _any_op:
+        run_ui(args)
+        return
 
     if args.shell:
         run_shell(args)

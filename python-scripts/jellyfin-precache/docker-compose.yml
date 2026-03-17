@@ -1,0 +1,16 @@
+services:
+  jellyfin-precache:
+    image: python:3.11-slim
+    restart: unless-stopped
+    ports:
+      - "9109:9109"
+    volumes:
+      - /opt/jellyfin-precache:/opt/jellyfin-precache:ro
+      # Mount the rclone VFS cache path so the script can read through it
+      - /mnt/media:/mnt/media:ro
+    environment:
+      JF_URL: ${JF_URL:-http://jellyfin:8096}
+      JF_TOKEN: ${JF_TOKEN}
+      PREFETCH_WORKERS: ${PREFETCH_WORKERS:-2}
+      PREFETCH_MAX_QUEUE: ${PREFETCH_MAX_QUEUE:-50}
+    command: python3 /opt/jellyfin-precache/jellyfin-precache.py
