@@ -3,3 +3,19 @@
 
 # So people are more comfortable, here's an explicit declaration, as well
 **/.venv/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Distribution / build artifacts
+dist/
+*.egg-info/
+*.whl
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo

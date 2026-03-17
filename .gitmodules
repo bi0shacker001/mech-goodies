@@ -7,3 +7,7 @@
 	path = programs/desec
 	url = https://github.com/bi0shacker001/desec.git
 	branch = main
+[submodule "programs/tailscale"]
+	path = programs/tailscale
+	url = https://github.com/bi0shacker001/tailscale.git
+	branch = main
