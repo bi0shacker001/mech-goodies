@@ -1,3 +1,4 @@
 [submodule "programs/moxmanager"]
 	path = programs/moxmanager
 	url = https://github.com/bi0shacker001/moxmanager.git
+	branch = main
