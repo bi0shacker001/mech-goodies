@@ -1,0 +1,5 @@
+# Since these are almost all python programs, let's simplify development and testing by ignoring virtual environments for any given projects, so they can be run in place
+.venv/
+
+# So people are more comfortable, here's an explicit declaration, as well
+**/.venv/
